@@ -1,7 +1,31 @@
 
 // ============================================================================
-// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.1
+// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.2
 // Google Apps Script — Full Codebase
+// ============================================================================
+// v8.2 CHANGES (from v8.1):
+//   - FIX: All spreadsheet access goes through getSS_(), which falls back to
+//     SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID) when there is no active
+//     spreadsheet (time-driven trigger / standalone execution).
+//   - FIX: checkForRepliesInternal_ now moves threads from the PeerReview
+//     label to PeerReview/Processed after capturing a reply, as documented.
+//     Previously the swap never happened and "Re-scan Processed Threads"
+//     could never find anything.
+//   - FIX: fillTemplate_ uses a function replacement so "$" sequences in
+//     sheet data no longer corrupt email bodies; empty values still render
+//     as "(not provided)".
+//   - FIX: generateCaseId_ now verifies uniqueness against the RASLO and
+//     Archive sheets (the case ID is the sole reply-matching key). Removed
+//     the ineffective Utilities.sleep(50) calls that claimed to do this.
+//   - FIX: Thread tracker sheet is auto-created at every call site, so a
+//     send can no longer email successfully and then crash before updating
+//     status (which allowed accidental duplicate sends).
+//   - FIX: rescanProcessedThreads uses the same sender+date dedup key as the
+//     main reply checker, so re-scans cannot double-append replies.
+//   - FIX: HTML dialog options are HTML-escaped (patient names with <, &, "
+//     no longer break the secondary review dialog).
+//   - FIX: HTML entity decoding order in getReplyFromMessage_ (&amp; last).
+//   - FIX: checkForReplies guards against a missing RASLO sheet.
 // ============================================================================
 // v8.1 CHANGES (from v8):
 //   - FIX: checkForRepliesInternal_ no longer skips messages just because they
@@ -19,6 +43,7 @@
 // ---------------------------------------------------------------------------
 
 var CONFIG = {
+  SPREADSHEET_ID: '1UzWdq8wnh3N4wqVFqT3y-REYv82h3TAtlhlYzSTHKf8',
   RASLO_SHEET: 'RASLO Tracking',
   ARCHIVE_SHEET: 'Archive',
   MMC_IMPORT_SHEET: 'MMC Import',
@@ -69,12 +94,29 @@ var RADIOLOGIST_NAMES = [
 
 
 // ============================================================================
+// 0b. SPREADSHEET ACCESS
+// ============================================================================
+
+/**
+ * Returns the tracking spreadsheet. Uses the active spreadsheet when running
+ * from the Sheets UI, and falls back to opening by ID for time-driven
+ * triggers or standalone execution where there is no active spreadsheet.
+ */
+function getSS_() {
+  var ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) { }
+  if (!ss) ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  return ss;
+}
+
+
+// ============================================================================
 // 1. DEBUG LOGGING
 // ============================================================================
 
 function debugLog_(functionName, message) {
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getSS_();
     var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
     if (!sheet) {
       sheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
@@ -98,7 +140,7 @@ function debugError_(functionName, error) {
     try { fullMsg = JSON.stringify(error); } catch(e2) { fullMsg = String(error); }
   }
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getSS_();
     var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
     if (!sheet) {
       sheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
@@ -163,7 +205,7 @@ function onOpen() {
 }
 
 function setupSystem() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
 
   ensureSheet_(ss, CONFIG.RASLO_SHEET, getRASLOHeaders_());
@@ -254,7 +296,7 @@ function promptForTemplateIds() {
 }
 
 function showDebugLog() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
   if (sheet) ss.setActiveSheet(sheet);
   else SpreadsheetApp.getUi().alert('No debug log. Run Initial Setup first.');
@@ -500,16 +542,43 @@ function applyRASLOValidations_(ss) {
 /**
  * Generates a unique case ID in format PR-YYYYMMDD-XXXX
  * where XXXX is a random 4-character alphanumeric string.
+ * Verifies the ID is not already used on the RASLO or Archive sheets,
+ * since the case ID is the sole key matching email replies to rows.
  */
 function generateCaseId_() {
   var now = new Date();
   var datePart = Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyyMMdd');
   var chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no ambiguous chars (0/O, 1/I/L)
-  var rand = '';
-  for (var i = 0; i < 4; i++) {
-    rand += chars.charAt(Math.floor(Math.random() * chars.length));
+  var id = '';
+  for (var attempt = 0; attempt < 5; attempt++) {
+    var rand = '';
+    for (var i = 0; i < 4; i++) {
+      rand += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    id = 'PR-' + datePart + '-' + rand;
+    if (!caseIdExists_(id)) return id;
   }
-  return 'PR-' + datePart + '-' + rand;
+  return id;
+}
+
+/**
+ * Returns true if the given case ID already appears on the RASLO or
+ * Archive sheets.
+ */
+function caseIdExists_(caseId) {
+  try {
+    var ss = getSS_();
+    var raslo = ss.getSheetByName(CONFIG.RASLO_SHEET);
+    if (raslo && findRowByCaseId_(raslo, caseId) > 0) return true;
+    var archive = ss.getSheetByName(CONFIG.ARCHIVE_SHEET);
+    if (archive && archive.getLastRow() > 1) {
+      var ids = archive.getRange(2, CONFIG.RASLO_COLS.CASE_ID, archive.getLastRow() - 1, 1).getValues();
+      for (var i = 0; i < ids.length; i++) {
+        if ((ids[i][0] || '').toString().trim() === caseId) return true;
+      }
+    }
+  } catch (e) { }
+  return false;
 }
 
 /**
@@ -557,7 +626,7 @@ function extractCaseIdFromSubject_(subject) {
  * Use after upgrading from v4 or if rows were added manually.
  */
 function backfillCaseIds() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   if (!rasloSheet) { ui.alert('Error', 'RASLO sheet not found.', ui.ButtonSet.OK); return; }
@@ -575,7 +644,6 @@ function backfillCaseIds() {
       var newId = generateCaseId_();
       rasloSheet.getRange(i + 2, CONFIG.RASLO_COLS.CASE_ID).setValue(newId);
       filled++;
-      Utilities.sleep(50); // tiny delay to ensure unique IDs across milliseconds
     }
   }
 
@@ -653,7 +721,7 @@ function levenshtein_(a, b) {
 // ============================================================================
 
 function importMMCToRASLO() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var mmcSheet = ss.getSheetByName(CONFIG.MMC_IMPORT_SHEET);
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
@@ -700,7 +768,6 @@ function importMMCToRASLO() {
     ]);
     existingKeys[key] = true;
     imported++;
-    Utilities.sleep(50);
   }
 
   if (imported > 0) {
@@ -720,7 +787,7 @@ function importMMCToRASLO() {
 // ============================================================================
 
 function exportToMMC() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var mmcImportSheet = ss.getSheetByName(CONFIG.MMC_IMPORT_SHEET);
@@ -871,7 +938,7 @@ function callGemini_(freeformText, apiKeyOverride) {
 // ============================================================================
 
 function scanGmailForCases() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var inputSheet = ss.getSheetByName(CONFIG.GEMINI_INPUT_SHEET);
@@ -963,7 +1030,7 @@ function scanGmailForCases() {
 // ============================================================================
 
 function parseGeminiInput() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var inputSheet = ss.getSheetByName(CONFIG.GEMINI_INPUT_SHEET);
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
@@ -1037,7 +1104,7 @@ function showPasteDialog() {
 }
 
 function parsePastedTextDirect_(text) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var inputSheet = ss.getSheetByName(CONFIG.GEMINI_INPUT_SHEET);
   if (!rasloSheet) throw new Error('RASLO sheet not found. Run Initial Setup.');
@@ -1115,7 +1182,7 @@ function parsePastedTextDirect_(text) {
 // ============================================================================
 
 function getSelectedRASLORows_() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var activeSheet = ss.getActiveSheet();
   if (activeSheet.getName() !== CONFIG.RASLO_SHEET) return null;
 
@@ -1133,7 +1200,7 @@ function getSelectedRASLORows_() {
     }
   }
 
-  var rows = Object.keys(rowSet).map(function(k) { return parseInt(k); });
+  var rows = Object.keys(rowSet).map(function(k) { return parseInt(k, 10); });
   rows.sort(function(a, b) { return a - b; });
   return rows;
 }
@@ -1156,10 +1223,10 @@ function sendPrimaryReviewsSelected() {
     return;
   }
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var radSheet = ss.getSheetByName(CONFIG.RAD_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
   if (!rasloSheet || !radSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
 
   var radEmails = buildRadEmailLookup_(radSheet);
@@ -1286,10 +1353,10 @@ function sendSecondaryReviewsSelected() {
     return;
   }
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var radSheet = ss.getSheetByName(CONFIG.RAD_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
   if (!rasloSheet || !radSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
 
   var radEmails = buildRadEmailLookup_(radSheet);
@@ -1418,7 +1485,7 @@ function sendRemindersSelected() {
     return;
   }
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var radSheet = ss.getSheetByName(CONFIG.RAD_SHEET);
   if (!rasloSheet || !radSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
@@ -1561,11 +1628,11 @@ function sendRemindersSelected() {
 // ============================================================================
 
 function sendPrimaryReviewsAll() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var radSheet = ss.getSheetByName(CONFIG.RAD_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
   if (!rasloSheet || !radSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
 
   var radEmails = buildRadEmailLookup_(radSheet);
@@ -1627,7 +1694,7 @@ function sendPrimaryReviewsAll() {
  * v8.1: Self-review is allowed. The warning indicator and block have been removed.
  */
 function showSecondaryReviewDialogAll() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var data = rasloSheet.getDataRange().getValues();
 
@@ -1650,12 +1717,12 @@ function showSecondaryReviewDialogAll() {
   var caseOpts = '';
   for (var i = 0; i < eligible.length; i++) {
     var c = eligible[i];
-    caseOpts += '<option value="' + c.caseId + '">' + c.caseId + ' — ' + c.patient + ' - ' + c.studyType + ' ' + c.eventDate + ' (' + c.attrib + ')</option>';
+    caseOpts += '<option value="' + escapeHtml_(c.caseId) + '">' + escapeHtml_(c.caseId + ' — ' + c.patient + ' - ' + c.studyType + ' ' + c.eventDate + ' (' + c.attrib + ')') + '</option>';
   }
   var radOpts = '';
   for (var i = 0; i < RADIOLOGIST_NAMES.length; i++) {
     if (RADIOLOGIST_NAMES[i] !== 'VetMed' && RADIOLOGIST_NAMES[i] !== 'None')
-      radOpts += '<option value="' + RADIOLOGIST_NAMES[i] + '">' + RADIOLOGIST_NAMES[i] + '</option>';
+      radOpts += '<option value="' + escapeHtml_(RADIOLOGIST_NAMES[i]) + '">' + escapeHtml_(RADIOLOGIST_NAMES[i]) + '</option>';
   }
 
   var html = HtmlService.createHtmlOutput(
@@ -1672,10 +1739,10 @@ function showSecondaryReviewDialogAll() {
 
 /** Single secondary review send (used by legacy dialog). */
 function sendSecondaryReviewSingle(caseId, reviewerName) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var radSheet = ss.getSheetByName(CONFIG.RAD_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
 
   var email = buildRadEmailLookup_(radSheet)[reviewerName];
   if (!email) throw new Error('No email for ' + reviewerName);
@@ -1725,11 +1792,11 @@ function sendSecondaryReviewSingle(caseId, reviewerName) {
 // ============================================================================
 
 function checkForReplies() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
-  if (!trackerSheet) { ui.alert('Error', 'Thread tracker not found.', ui.ButtonSet.OK); return; }
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
+  if (!rasloSheet) { ui.alert('Error', 'RASLO sheet not found. Run Initial Setup.', ui.ButtonSet.OK); return; }
 
   var result = checkForRepliesInternal_(rasloSheet, trackerSheet);
 
@@ -1741,10 +1808,10 @@ function checkForReplies() {
 }
 
 function rescanProcessedThreads() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
-  var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+  var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
   if (!rasloSheet || !trackerSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
 
   var q = 'label:"' + CONFIG.GMAIL_PROCESSED_LABEL + '" subject:"' + CONFIG.SUBJECT_PREFIX + '"';
@@ -1796,10 +1863,12 @@ function rescanProcessedThreads() {
       var rdate = msg.getDate().toLocaleDateString();
       if (!reply.trim()) continue;
 
-      var entry = '[' + sender + ' - ' + rdate + ']: ' + reply.trim();
+      var dedupKey = '[' + sender + ' - ' + rdate + ']';
+      var entry = dedupKey + ': ' + reply.trim();
       var disc = rasloSheet.getRange(row, CONFIG.RASLO_COLS.DISCUSSION).getValue() || '';
 
-      if (disc.indexOf(entry.substring(0, 50)) >= 0) continue;
+      // Same dedup key as checkForRepliesInternal_ so re-scans never double-append
+      if (disc.indexOf(dedupKey) >= 0) continue;
 
       debugLog_('rescanProcessedThreads', 'Recovered reply for ' + caseId + ' from ' + sender);
       rasloSheet.getRange(row, CONFIG.RASLO_COLS.DISCUSSION).setValue(disc ? disc + '\n\n' + entry : entry);
@@ -1870,7 +1939,7 @@ function checkForRepliesInternal_(rasloSheet, trackerSheet) {
 
   // Build set of archived case IDs so we don't report them as orphaned
   var archivedIds = {};
-  var archiveSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.ARCHIVE_SHEET);
+  var archiveSheet = getSS_().getSheetByName(CONFIG.ARCHIVE_SHEET);
   if (archiveSheet && archiveSheet.getLastRow() > 1) {
     var archiveIds = archiveSheet.getRange(2, CONFIG.RASLO_COLS.CASE_ID, archiveSheet.getLastRow() - 1, 1).getValues();
     for (var a = 0; a < archiveIds.length; a++) {
@@ -1937,6 +2006,7 @@ function checkForRepliesInternal_(rasloSheet, trackerSheet) {
     // Process ALL messages. Outgoing review emails are filtered by the
     // empty-reply check below because extractReplyText_ returns '' for them
     // (their body starts with the template marker "RASLO PEER REVIEW").
+    var threadCaptured = false;
     for (var m = 0; m < msgs.length; m++) {
       var msg = msgs[m];
 
@@ -1972,7 +2042,21 @@ function checkForRepliesInternal_(rasloSheet, trackerSheet) {
       }
       count++;
       capturedThisRun[caseId] = true;
+      threadCaptured = true;
       updated.push(caseId + ': ' + sender + ' (' + rtype + ')');
+    }
+
+    // Move the thread from PeerReview to PeerReview/Processed once a reply
+    // has been captured, matching the documented label lifecycle and making
+    // "Re-scan Processed Threads" able to find these threads later.
+    if (threadCaptured) {
+      try {
+        var baseLabel = GmailApp.getUserLabelByName(CONFIG.GMAIL_LABEL);
+        if (baseLabel) baseLabel.removeFromThread(thread);
+        getOrCreateLabel_(CONFIG.GMAIL_PROCESSED_LABEL).addToThread(thread);
+      } catch (labelErr) {
+        debugError_('checkForRepliesInternal_', 'Label swap failed for ' + caseId + ': ' + labelErr.message);
+      }
     }
   }
 
@@ -1986,7 +2070,7 @@ function checkForRepliesInternal_(rasloSheet, trackerSheet) {
 // ============================================================================
 
 function archiveCompletedCases() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   var archiveSheet = ss.getSheetByName(CONFIG.ARCHIVE_SHEET);
@@ -2047,7 +2131,7 @@ function archiveCompletedCases() {
 // ============================================================================
 
 function generateBODSummaryDoc() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
   if (!rasloSheet) { ui.alert('Error', 'RASLO sheet not found.', ui.ButtonSet.OK); return; }
@@ -2323,7 +2407,12 @@ function buildRadEmailLookup_(radSheet) {
 
 function fillTemplate_(t, reps) {
   var r = t, k = Object.keys(reps);
-  for (var i = 0; i < k.length; i++) r = r.replace(new RegExp(k[i].replace(/[{}]/g,'\\$&'), 'g'), reps[k[i]] || '(not provided)');
+  for (var i = 0; i < k.length; i++) {
+    var val = reps[k[i]];
+    val = (val === null || val === undefined || val.toString().trim() === '') ? '(not provided)' : val.toString();
+    // Function replacement so '$' sequences in sheet data (e.g. "$&") are kept literal
+    r = r.replace(new RegExp(k[i].replace(/[{}]/g, '\\$&'), 'g'), (function(v) { return function() { return v; }; })(val));
+  }
   return r;
 }
 
@@ -2391,11 +2480,11 @@ function getReplyFromMessage_(msg) {
   html = html.replace(/<\/?(p|div|tr|li|h[1-6])[^>]*>/gi, '\n');
   html = html.replace(/<[^>]+>/g, '');
   html = html.replace(/&nbsp;/gi, ' ');
-  html = html.replace(/&amp;/gi, '&');
   html = html.replace(/&lt;/gi, '<');
   html = html.replace(/&gt;/gi, '>');
   html = html.replace(/&quot;/gi, '"');
   html = html.replace(/&#39;/gi, "'");
+  html = html.replace(/&amp;/gi, '&');  // decode last so "&amp;lt;" doesn't double-decode
   html = html.replace(/\n{3,}/g, '\n\n').trim();
   return extractReplyText_(html);
 }
@@ -2460,9 +2549,9 @@ function installTimeTrigger() {
 
 function checkForRepliesAuto_() {
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss = getSS_();
     var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
-    var trackerSheet = ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET);
+    var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
     if (!trackerSheet || !rasloSheet) return;
 
     var result = checkForRepliesInternal_(rasloSheet, trackerSheet);
