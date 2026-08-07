@@ -1,7 +1,26 @@
 
 // ============================================================================
-// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.2
+// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.3
 // Google Apps Script — Full Codebase
+// ============================================================================
+// v8.3 CHANGES (from v8.2) — MMC EXPORT FIXES:
+//   - FIX: exportToMMC no longer drops cases that have no matching row on the
+//     MMC Import sheet. The import sheet is now used only to carry DOB, QM No,
+//     and Reminder Email onto the export, not as a filter. Previously
+//     "if (!orig) continue" silently discarded every unmatched case.
+//   - FIX: exportToMMC now also reads the Archive sheet. Completed cases are
+//     moved to Archive by archiveCompletedCases, so an export reading only the
+//     tracker lost every case that finished the workflow.
+//   - FIX: Matching is normalized. normalizeDateKey_ handles Date objects and
+//     text dates ('3/14/2026', '2026-03-14', '3-14-26') identically, and
+//     normalizeNameKey_ ignores case, punctuation, and word order. The old key
+//     compared raw strings, so a Date on one sheet never matched text on the
+//     other. Falls back to MRN, then unique-name matching.
+//   - FIX: The export reports exactly which cases were exported without MMC
+//     Import enrichment, instead of failing silently.
+//   - FIX: MMC import duplicate detection uses the same normalized keys and
+//     now also checks the Archive, so re-importing a batch cannot re-create
+//     cases that were already completed and archived.
 // ============================================================================
 // v8.2 CHANGES (from v8.1):
 //   - FIX: All spreadsheet access goes through getSS_(), which falls back to
@@ -730,13 +749,20 @@ function importMMCToRASLO() {
   var mmcData = mmcSheet.getDataRange().getValues();
   if (mmcData.length <= 1) { ui.alert('No data on MMC Import sheet.'); return; }
 
-  var rasloData = rasloSheet.getDataRange().getValues();
+  // Duplicate detection covers the archive too — otherwise re-importing a
+  // batch would re-create cases that already finished the workflow.
   var existingKeys = {};
-  for (var i = 1; i < rasloData.length; i++) {
-    var pn = (rasloData[i][CONFIG.RASLO_COLS.PATIENT_NAME - 1] || '').toString().trim().toLowerCase();
-    var ed = formatDateForKey_(rasloData[i][CONFIG.RASLO_COLS.EVENT_DATE - 1]);
-    if (pn) existingKeys[pn + '|' + ed] = true;
+  function indexExisting(sheet) {
+    if (!sheet || sheet.getLastRow() < 2) return;
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      var pn = normalizeNameKey_(data[i][CONFIG.RASLO_COLS.PATIENT_NAME - 1]);
+      if (!pn) continue;
+      existingKeys[pn + '|' + normalizeDateKey_(data[i][CONFIG.RASLO_COLS.EVENT_DATE - 1])] = true;
+    }
   }
+  indexExisting(rasloSheet);
+  indexExisting(ss.getSheetByName(CONFIG.ARCHIVE_SHEET));
 
   var imported = 0, skipped = 0, nameIssues = [];
 
@@ -745,7 +771,7 @@ function importMMCToRASLO() {
     var patName = (row[CONFIG.MMC_COLS.PATIENT_NAME - 1] || '').toString().trim();
     if (!patName) continue;
     var evtDate = row[CONFIG.MMC_COLS.EVENT_DATE - 1];
-    var key = patName.toLowerCase() + '|' + formatDateForKey_(evtDate);
+    var key = normalizeNameKey_(patName) + '|' + normalizeDateKey_(evtDate);
     if (existingKeys[key]) { skipped++; continue; }
 
     var raw = (row[CONFIG.MMC_COLS.ATTRIB_PHYS - 1] || '').toString().trim();
@@ -786,42 +812,137 @@ function importMMCToRASLO() {
 // 7. RASLO EXPORT TO MMC
 // ============================================================================
 
+/**
+ * Exports MMC cases to the MMC Export sheet.
+ *
+ * The MMC Import sheet is used only to carry DOB, QM No, and Reminder Email
+ * back onto the export — it is NOT a filter. Cases are pulled from the live
+ * tracker and from the Archive, so cases that reached "Completed" (and were
+ * therefore archived) still export.
+ */
 function exportToMMC() {
   var ss = getSS_();
   var ui = SpreadsheetApp.getUi();
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
+  var archiveSheet = ss.getSheetByName(CONFIG.ARCHIVE_SHEET);
   var mmcImportSheet = ss.getSheetByName(CONFIG.MMC_IMPORT_SHEET);
-  var mmcExportSheet = ss.getSheetByName(CONFIG.MMC_EXPORT_SHEET);
-  if (!rasloSheet || !mmcImportSheet || !mmcExportSheet) { ui.alert('Error', 'Sheets not found.', ui.ButtonSet.OK); return; }
+  var mmcExportSheet = ensureSheet_(ss, CONFIG.MMC_EXPORT_SHEET, getMMCHeaders_());
+  if (!rasloSheet) { ui.alert('Error', 'RASLO Tracking sheet not found. Run Initial Setup.', ui.ButtonSet.OK); return; }
 
-  var rasloData = rasloSheet.getDataRange().getValues();
-  var mmcData = mmcImportSheet.getDataRange().getValues();
-  if (mmcExportSheet.getLastRow() > 1) mmcExportSheet.getRange(2, 1, mmcExportSheet.getLastRow() - 1, mmcExportSheet.getLastColumn()).clear();
+  // ---- Collect candidate cases from the tracker and the archive ----
+  var cases = [];
+  var seen = {};
 
-  var mmcLookup = {};
-  for (var i = 1; i < mmcData.length; i++) {
-    var pn = (mmcData[i][CONFIG.MMC_COLS.PATIENT_NAME - 1] || '').toString().trim().toLowerCase();
-    mmcLookup[pn + '|' + formatDateForKey_(mmcData[i][CONFIG.MMC_COLS.EVENT_DATE - 1])] = mmcData[i];
+  function collectCases(sheet, source) {
+    if (!sheet || sheet.getLastRow() < 2) return;
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      var r = data[i];
+      var pn = (r[CONFIG.RASLO_COLS.PATIENT_NAME - 1] || '').toString().trim();
+      if (!pn) continue;
+      var cid = (r[CONFIG.RASLO_COLS.CASE_ID - 1] || '').toString().trim();
+      var dedupKey = cid || (normalizeNameKey_(pn) + '|' + normalizeDateKey_(r[CONFIG.RASLO_COLS.EVENT_DATE - 1]));
+      if (seen[dedupKey]) continue;
+      seen[dedupKey] = true;
+      cases.push({ data: r, name: pn, source: source });
+    }
   }
 
+  collectCases(rasloSheet, 'Tracking');
+  collectCases(archiveSheet, 'Archive');
+
+  // ---- Index MMC Import for enrichment (name+date, then MRN, then name) ----
+  var byNameDate = {}, byMrn = {}, byName = {}, ambiguousName = {};
+  if (mmcImportSheet && mmcImportSheet.getLastRow() > 1) {
+    var mmcData = mmcImportSheet.getDataRange().getValues();
+    for (var i = 1; i < mmcData.length; i++) {
+      var row = mmcData[i];
+      var nm = (row[CONFIG.MMC_COLS.PATIENT_NAME - 1] || '').toString().trim();
+      if (!nm) continue;
+      var nk = normalizeNameKey_(nm);
+      byNameDate[nk + '|' + normalizeDateKey_(row[CONFIG.MMC_COLS.EVENT_DATE - 1])] = row;
+      var mk = normalizeMrnKey_(row[CONFIG.MMC_COLS.MRN - 1]);
+      if (mk) byMrn[mk] = row;
+      if (byName[nk]) ambiguousName[nk] = true; else byName[nk] = row;
+    }
+  }
+
+  function findImportRow(c) {
+    var nk = normalizeNameKey_(c.name);
+    var hit = byNameDate[nk + '|' + normalizeDateKey_(c.data[CONFIG.RASLO_COLS.EVENT_DATE - 1])];
+    if (hit) return hit;
+    var mk = normalizeMrnKey_(c.data[CONFIG.RASLO_COLS.MRN - 1]);
+    if (mk && byMrn[mk]) return byMrn[mk];
+    if (byName[nk] && !ambiguousName[nk]) return byName[nk];
+    return null;
+  }
+
+  // ---- Build export rows ----
   var exportRows = [];
-  for (var i = 1; i < rasloData.length; i++) {
-    var r = rasloData[i];
-    var pn = (r[CONFIG.RASLO_COLS.PATIENT_NAME - 1] || '').toString().trim();
-    var orig = mmcLookup[pn.toLowerCase() + '|' + formatDateForKey_(r[CONFIG.RASLO_COLS.EVENT_DATE - 1])];
-    if (!orig) continue;
+  var enriched = 0, fromArchive = 0, skippedNonMmc = 0;
+  var unmatched = [];
+
+  for (var i = 0; i < cases.length; i++) {
+    var c = cases[i];
+    var r = c.data;
+    var orig = findImportRow(c);
+    var system = (r[CONFIG.RASLO_COLS.SYSTEM - 1] || '').toString().trim().toUpperCase();
+
+    // Export every MMC-system case, plus any case that traces back to an MMC
+    // Import row even if its System cell was later edited.
+    if (system !== 'MMC' && !orig) { skippedNonMmc++; continue; }
+
+    if (orig) {
+      enriched++;
+    } else {
+      var cid = (r[CONFIG.RASLO_COLS.CASE_ID - 1] || '').toString().trim() || '(no ID)';
+      unmatched.push(cid + ': ' + c.name);
+    }
+    if (c.source === 'Archive') fromArchive++;
+
     exportRows.push([
-      r[CONFIG.RASLO_COLS.CASE_STATUS-1]||'', r[CONFIG.RASLO_COLS.DATE_STATUS-1]||'', pn,
-      orig[CONFIG.MMC_COLS.DOB-1]||'', r[CONFIG.RASLO_COLS.MRN-1]||orig[CONFIG.MMC_COLS.MRN-1]||'',
-      orig[CONFIG.MMC_COLS.QM_NO-1]||'', r[CONFIG.RASLO_COLS.EVENT_DATE-1]||'',
-      r[CONFIG.RASLO_COLS.STUDY_TYPE-1]||'', r[CONFIG.RASLO_COLS.ATTRIB_PHYS-1]||'',
-      r[CONFIG.RASLO_COLS.NARRATIVE-1]||'', r[CONFIG.RASLO_COLS.IMAGING_RATING-1]||'',
-      r[CONFIG.RASLO_COLS.DISCUSSION-1]||'', orig[CONFIG.MMC_COLS.REMINDER_EMAIL-1]||''
+      r[CONFIG.RASLO_COLS.CASE_STATUS - 1] || '',
+      r[CONFIG.RASLO_COLS.DATE_STATUS - 1] || '',
+      c.name,
+      orig ? (orig[CONFIG.MMC_COLS.DOB - 1] || '') : '',
+      r[CONFIG.RASLO_COLS.MRN - 1] || (orig ? orig[CONFIG.MMC_COLS.MRN - 1] : '') || '',
+      orig ? (orig[CONFIG.MMC_COLS.QM_NO - 1] || '') : '',
+      r[CONFIG.RASLO_COLS.EVENT_DATE - 1] || '',
+      r[CONFIG.RASLO_COLS.STUDY_TYPE - 1] || '',
+      r[CONFIG.RASLO_COLS.ATTRIB_PHYS - 1] || '',
+      r[CONFIG.RASLO_COLS.NARRATIVE - 1] || '',
+      r[CONFIG.RASLO_COLS.IMAGING_RATING - 1] || '',
+      r[CONFIG.RASLO_COLS.DISCUSSION - 1] || '',
+      orig ? (orig[CONFIG.MMC_COLS.REMINDER_EMAIL - 1] || '') : ''
     ]);
   }
 
-  if (exportRows.length > 0) mmcExportSheet.getRange(2, 1, exportRows.length, exportRows[0].length).setValues(exportRows);
-  ui.alert('MMC Export', exportRows.length + ' cases exported. DOB, QM No, Reminder Email preserved.', ui.ButtonSet.OK);
+  // ---- Write ----
+  var headerCount = getMMCHeaders_().length;
+  var lastRow = mmcExportSheet.getLastRow();
+  if (lastRow > 1) {
+    mmcExportSheet.getRange(2, 1, lastRow - 1, Math.max(mmcExportSheet.getLastColumn(), headerCount)).clearContent();
+  }
+  if (exportRows.length > 0) {
+    mmcExportSheet.getRange(2, 1, exportRows.length, headerCount).setValues(exportRows);
+    mmcExportSheet.getRange(2, CONFIG.MMC_COLS.DATE_STATUS, exportRows.length, 1).setNumberFormat('yyyy-MM-dd');
+    mmcExportSheet.getRange(2, CONFIG.MMC_COLS.EVENT_DATE, exportRows.length, 1).setNumberFormat('yyyy-MM-dd');
+  }
+
+  var msg = exportRows.length + ' case(s) exported to the MMC Export sheet.\n\n';
+  msg += enriched + ' matched an MMC Import row (DOB, QM No, Reminder Email carried over).\n';
+  if (fromArchive > 0) msg += fromArchive + ' came from the Archive sheet (already completed).\n';
+  if (unmatched.length > 0) {
+    msg += '\n' + unmatched.length + ' case(s) had no MMC Import match. They WERE exported, but with ' +
+      'DOB, QM No, and Reminder Email blank:\n';
+    for (var u = 0; u < unmatched.length && u < 20; u++) msg += '  ' + unmatched[u] + '\n';
+    if (unmatched.length > 20) msg += '  ... and ' + (unmatched.length - 20) + ' more\n';
+  }
+  if (skippedNonMmc > 0) msg += '\n' + skippedNonMmc + ' non-MMC case(s) skipped.';
+
+  debugLog_('exportToMMC', 'Exported ' + exportRows.length + ' (' + enriched + ' enriched, ' +
+    unmatched.length + ' unmatched, ' + fromArchive + ' archived, ' + skippedNonMmc + ' non-MMC skipped)');
+  ui.alert('MMC Export', msg, ui.ButtonSet.OK);
 }
 
 
@@ -2385,9 +2506,59 @@ function generateBODSummaryDoc() {
 // ============================================================================
 
 function formatDateForKey_(d) {
-  if (!d) return '';
-  if (d instanceof Date) return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  return d.toString().trim();
+  return normalizeDateKey_(d);
+}
+
+function pad2_(v) {
+  v = v.toString();
+  return v.length < 2 ? '0' + v : v;
+}
+
+/**
+ * Normalizes a date cell to 'yyyy-MM-dd' for matching. Handles real Date
+ * objects and the common text forms ('2026-03-14', '3/14/2026', '03-14-26').
+ * Sheets stores dates as Date objects on one sheet and as text on another
+ * depending on how the data arrived, so raw string comparison never matched.
+ */
+function normalizeDateKey_(d) {
+  if (d === null || d === undefined || d === '') return '';
+  if (d instanceof Date) {
+    return isNaN(d.getTime()) ? '' : Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  var s = d.toString().trim();
+  if (!s) return '';
+
+  var m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) return m[1] + '-' + pad2_(m[2]) + '-' + pad2_(m[3]);
+
+  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})/);
+  if (m) {
+    var yr = m[3].length === 2 ? '20' + m[3] : m[3];
+    return yr + '-' + pad2_(m[1]) + '-' + pad2_(m[2]);
+  }
+
+  var parsed = new Date(s);
+  if (!isNaN(parsed.getTime())) return Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return s.toLowerCase();
+}
+
+/**
+ * Normalizes a patient name for matching: case, punctuation, and word order
+ * are ignored, so 'Doe, Jane M.' and 'jane m doe' produce the same key.
+ */
+function normalizeNameKey_(name) {
+  var s = (name || '').toString().toLowerCase();
+  s = s.replace(/['’.]/g, '');        // drop intra-word marks: O'Brien -> obrien, M. -> m
+  s = s.replace(/[^a-z0-9\s]/g, ' ');      // other punctuation (commas, hyphens) separates words
+  s = s.replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.split(' ').sort().join(' ');
+}
+
+/** Normalizes an MRN/FIN for matching (strips punctuation and leading zeros). */
+function normalizeMrnKey_(mrn) {
+  var s = (mrn || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+  return s.replace(/^0+/, '');
 }
 
 function formatDateForDisplay_(d) {

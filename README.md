@@ -11,7 +11,7 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 
 | File | Purpose |
 |---|---|
-| `Code.js` | Entire system (v8.2) |
+| `Code.js` | Entire system (v8.3) |
 | `appsscript.json` | Apps Script manifest (V8 runtime) |
 | `.clasp.json` | clasp binding to the Apps Script project |
 
@@ -20,6 +20,16 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 ```bash
 clasp push
 ```
+
+## v8.3 fixes — MMC Export dropping cases (2026-08-07)
+
+Reported symptom: cases with System `MMC` and status `Completed` never appeared on the MMC Export sheet. Three independent causes, all of which failed silently:
+
+1. **The MMC Import sheet was acting as a filter, not an enrichment source.** `exportToMMC` looked up each case in MMC Import and ran `if (!orig) continue;` — so any case without a matching import row was silently discarded. That covers every MMC case entered through the paste dialog or Gmail scan (which never creates an import row), and every case whose import row was cleared when a newer MMC batch was pasted in. The import sheet now only supplies DOB, QM No, and Reminder Email; unmatched cases export with those three fields blank.
+2. **Completed cases had been archived out of scope.** `archiveCompletedCases` moves `Completed` rows to the Archive sheet and deletes them from RASLO Tracking, but the export only ever read RASLO Tracking. It now reads both, de-duplicated by Case ID.
+3. **The match key could not match across sheets.** The old key was `lowercased-name|formatDateForKey_(date)`, and `formatDateForKey_` returned `yyyy-MM-dd` for real `Date` objects but the raw string for anything else. MMC Import holds pasted dates while Gemini-parsed rows hold text dates, so the two sides produced different keys for the same day. Matching now normalizes dates (`Date`, `2026-03-14`, `3/14/2026`, `3-14-26` all collapse to one key) and names (case, punctuation, and word order ignored, so `Doe, Jane M.` matches `jane m doe`), with fallback matching on MRN and then unique name.
+
+Also fixed: the export now reports which cases went out without enrichment instead of saying nothing, and MMC import duplicate detection uses the same normalized keys **and** checks the Archive — previously, re-importing a batch would re-create cases that had already been completed and archived.
 
 ## v8.2 fixes (2026-08-07 review)
 
