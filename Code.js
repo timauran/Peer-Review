@@ -1,7 +1,21 @@
 
 // ============================================================================
-// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.3
+// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.4
 // Google Apps Script — Full Codebase
+// ============================================================================
+// v8.4 CHANGES (from v8.3) — ORGAN SYSTEM TRACKING:
+//   - NEW: "Organ System" column (O, col 15) on RASLO Tracking and Archive.
+//     Appended after Case ID so existing data does not shift; Initial Setup
+//     adds the header to existing sheets.
+//   - NEW: Dropdown options are read from Reference!F under the header
+//     "Systems". Setup seeds ORGAN_SYSTEM_DEFAULTS only if that column is
+//     empty and never overwrites it (setupReferenceSheet_ no longer calls
+//     sheet.clear(), which would have wiped the user's list).
+//   - NEW: Gemini extraction returns organ_system, constrained to the live
+//     Reference list. matchOrganSystem_ normalizes the result; unmatched
+//     values are kept and flagged by a warn-only validation rule.
+//   - NEW: Organ System appears in the BOD summary doc and is available to
+//     custom email templates as {{ORGAN_SYSTEM}}.
 // ============================================================================
 // v8.3 CHANGES (from v8.2) — MMC EXPORT FIXES:
 //   - FIX: exportToMMC no longer drops cases that have no matching row on the
@@ -73,14 +87,22 @@ var CONFIG = {
   THREAD_TRACKER_SHEET: '_ThreadTracker',
   DEBUG_LOG_SHEET: '_DebugLog',
 
-  // Column positions (1-based) for RASLO Tracking — CASE_ID is new at col 14
+  // Column positions (1-based) for RASLO Tracking.
+  // New columns are appended at the end so existing data never shifts:
+  // CASE_ID was added at col 14 (v5), ORGAN_SYSTEM at col 15 (v8.4).
   RASLO_COLS: {
     CASE_STATUS: 1, DATE_STATUS: 2, PATIENT_NAME: 3, SYSTEM: 4,
     MRN: 5, EVENT_DATE: 6, STUDY_TYPE: 7, ATTRIB_PHYS: 8,
     REVIEW_PHYS: 9, NARRATIVE: 10, IMAGING_RATING: 11,
-    STATUS_NOTES: 12, DISCUSSION: 13, CASE_ID: 14
+    STATUS_NOTES: 12, DISCUSSION: 13, CASE_ID: 14, ORGAN_SYSTEM: 15
   },
-  RASLO_COL_COUNT: 14,
+  RASLO_COL_COUNT: 15,
+
+  // Reference sheet: column F holds the user-maintained organ system list
+  // under the header "Systems". Setup seeds it only if empty and never
+  // overwrites it.
+  REF_ORGAN_SYSTEM_COL: 6,
+  REF_ORGAN_SYSTEM_HEADER: 'Systems',
 
   MMC_COLS: {
     CASE_STATUS: 1, DATE_STATUS: 2, PATIENT_NAME: 3, DOB: 4,
@@ -101,6 +123,13 @@ var STATUS_OPTIONS = ['Entered', 'Out for primary review', 'Back from primary', 
 var SYSTEM_OPTIONS = ['SVH', 'TCCH', 'FH', 'AG', 'MMC', 'RASLO'];
 var STUDY_TYPE_OPTIONS = ['CT', 'MRI', 'NM', 'IR', 'XR', 'US', 'FL', 'MG'];
 var RATING_OPTIONS = ['eV1', 'eV2', 'eV3', 'eV4', 'eV5'];
+// Seed values for Reference!F ("Systems"). Used only when that column is
+// empty; the live list is always read from the sheet via getOrganSystems_().
+var ORGAN_SYSTEM_DEFAULTS = [
+  'Neuro', 'Head & Neck', 'Spine', 'Chest', 'Cardiac', 'Breast',
+  'Abdomen', 'Pelvis', 'GI', 'GU', 'Musculoskeletal', 'Vascular',
+  'Pediatric', 'Other'
+];
 var RADIOLOGIST_NAMES = [
   'Auran, Timothy', 'Barton, Mark', 'Burnette, William', 'Cartland, James',
   'Cedillo, Mario', 'Davis, Timothy', 'Duberg, Arthur', 'Gulaya, Karan',
@@ -241,24 +270,15 @@ function setupSystem() {
     debugSheet.setColumnWidth(3, 600);
   }
 
-  // Ensure RASLO sheet has the Case ID column (for upgrades from v4)
+  // Ensure appended columns exist on sheets created by older versions
+  // (Case ID from v4 upgrades, Organ System from pre-v8.4 sheets).
   var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
-  if (rasloSheet) {
-    var headers = rasloSheet.getRange(1, 1, 1, rasloSheet.getLastColumn()).getValues()[0];
-    if (headers.length < CONFIG.RASLO_COLS.CASE_ID || headers[CONFIG.RASLO_COLS.CASE_ID - 1] !== 'Case ID') {
-      rasloSheet.getRange(1, CONFIG.RASLO_COLS.CASE_ID).setValue('Case ID').setFontWeight('bold');
-      debugLog_('setupSystem', 'Added Case ID column header');
-    }
-  }
-
-  // Ensure Archive sheet has Case ID column too
   var archiveSheet = ss.getSheetByName(CONFIG.ARCHIVE_SHEET);
-  if (archiveSheet) {
-    var aHeaders = archiveSheet.getRange(1, 1, 1, archiveSheet.getLastColumn()).getValues()[0];
-    if (aHeaders.length < CONFIG.RASLO_COLS.CASE_ID || aHeaders[CONFIG.RASLO_COLS.CASE_ID - 1] !== 'Case ID') {
-      archiveSheet.getRange(1, CONFIG.RASLO_COLS.CASE_ID).setValue('Case ID').setFontWeight('bold');
-    }
-  }
+  [rasloSheet, archiveSheet].forEach(function(sh) {
+    if (!sh) return;
+    ensureHeader_(sh, CONFIG.RASLO_COLS.CASE_ID, 'Case ID');
+    ensureHeader_(sh, CONFIG.RASLO_COLS.ORGAN_SYSTEM, 'Organ System');
+  });
 
   setupReferenceSheet_(ss);
   setupRadiologistSheet_(ss);
@@ -271,10 +291,12 @@ function setupSystem() {
 
   try { ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET).hideSheet(); } catch (e) { }
 
-  debugLog_('setupSystem', 'Setup completed (v8.1)');
+  debugLog_('setupSystem', 'Setup completed (v8.4)');
 
   ui.alert('Setup Complete',
-    'System initialized (v8.1).\n\n' +
+    'System initialized (v8.4).\n\n' +
+    'Organ System column (O) added. Its dropdown options come from the\n' +
+    'Reference sheet, column F ("Systems") — edit that list to change them.\n\n' +
     'Gmail labels created:\n' +
     '  - PeerReviewInput (label emails to scan for new cases)\n' +
     '  - PeerReviewInput/Processed (auto-applied after scanning)\n' +
@@ -357,6 +379,11 @@ function showInstructions() {
     '<p>Every case gets a permanent <b>Case ID</b> (e.g. <code>PR-20260314-A7K2</code>) stored in column N. ' +
     'This ID is embedded in every email subject line and is how replies are matched back to cases — ' +
     'so row insertions, deletions, or sorting will never break reply tracking.</p>' +
+    '<p>Each case also has an <b>Organ System</b> (column O) for more detailed tracking. The dropdown options ' +
+    'come from the <b>Reference</b> sheet, column F (header <code>Systems</code>) — edit that list to change them. ' +
+    'Gemini fills this in automatically when cases are added by paste or Gmail scan; a value that does not match ' +
+    'the list is kept and flagged with a warning triangle so you can correct it. ' +
+    'Custom email templates can include it with <code>{{ORGAN_SYSTEM}}</code>.</p>' +
 
     '<h2>STEP 1 — ADD CASES</h2>' +
     '<p>Three ways to get cases into the RASLO Tracking sheet:</p>' +
@@ -479,7 +506,7 @@ function installTimeTriggerWithConfirm() {
 function getRASLOHeaders_() {
   return ['Case Status', 'Date Status Update', 'Patient Name', 'System',
     'MR#/FIN#', 'Event Date', 'Imaging Study Type', 'Attributing Physician',
-    'Reviewing Physician', 'Narrative', 'Imaging Rating', 'Status Notes', 'Discussion', 'Case ID'];
+    'Reviewing Physician', 'Narrative', 'Imaging Rating', 'Status Notes', 'Discussion', 'Case ID', 'Organ System'];
 }
 
 function getMMCHeaders_() {
@@ -504,7 +531,11 @@ function ensureSheet_(ss, name, headers) {
 function setupReferenceSheet_(ss) {
   var sheet = ss.getSheetByName(CONFIG.REF_SHEET);
   if (!sheet) sheet = ss.insertSheet(CONFIG.REF_SHEET);
-  sheet.clear();
+
+  // Rebuild only columns A–E from the code constants. Column F ("Systems")
+  // is user-maintained, so it must survive re-running setup — the old
+  // sheet.clear() would have wiped it.
+  sheet.getRange(1, 1, Math.max(sheet.getMaxRows(), 2), 5).clearContent();
   sheet.getRange('A1').setValue('Case Status').setFontWeight('bold');
   STATUS_OPTIONS.forEach(function(v, i) { sheet.getRange(i + 2, 1).setValue(v); });
   sheet.getRange('B1').setValue('System').setFontWeight('bold');
@@ -515,7 +546,19 @@ function setupReferenceSheet_(ss) {
   RATING_OPTIONS.forEach(function(v, i) { sheet.getRange(i + 2, 4).setValue(v); });
   sheet.getRange('E1').setValue('Radiologists').setFontWeight('bold');
   RADIOLOGIST_NAMES.forEach(function(v, i) { sheet.getRange(i + 2, 5).setValue(v); });
-  sheet.autoResizeColumns(1, 5);
+
+  // Seed the organ system list only when column F has no entries.
+  var col = CONFIG.REF_ORGAN_SYSTEM_COL;
+  if (getOrganSystems_(ss).length === 0) {
+    sheet.getRange(1, col).setValue(CONFIG.REF_ORGAN_SYSTEM_HEADER).setFontWeight('bold');
+    sheet.getRange(2, col, ORGAN_SYSTEM_DEFAULTS.length, 1)
+      .setValues(ORGAN_SYSTEM_DEFAULTS.map(function(v) { return [v]; }));
+    debugLog_('setupReferenceSheet_', 'Seeded ' + ORGAN_SYSTEM_DEFAULTS.length + ' default organ systems in Reference!F');
+  } else if (sheet.getRange(1, col).getValue() !== CONFIG.REF_ORGAN_SYSTEM_HEADER) {
+    sheet.getRange(1, col).setValue(CONFIG.REF_ORGAN_SYSTEM_HEADER).setFontWeight('bold');
+  }
+
+  sheet.autoResizeColumns(1, col);
 }
 
 function setupRadiologistSheet_(ss) {
@@ -549,6 +592,16 @@ function applyRASLOValidations_(ss) {
   setDropdown(CONFIG.RASLO_COLS.IMAGING_RATING, 4, RATING_OPTIONS.length);
   setDropdown(CONFIG.RASLO_COLS.ATTRIB_PHYS, 5, RADIOLOGIST_NAMES.length);
   setDropdown(CONFIG.RASLO_COLS.REVIEW_PHYS, 5, RADIOLOGIST_NAMES.length);
+
+  // Organ System: point at a generous range of Reference!F so the user can
+  // add options without re-running setup (blank cells are ignored by the
+  // dropdown). Warn rather than reject, so a Gemini value that didn't match
+  // the list is flagged for correction instead of being lost.
+  var organRows = Math.max(1, Math.min(200, ref.getMaxRows() - 1));
+  var organRule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(ref.getRange(2, CONFIG.REF_ORGAN_SYSTEM_COL, organRows, 1), true)
+    .setAllowInvalid(true).build();
+  sheet.getRange(2, CONFIG.RASLO_COLS.ORGAN_SYSTEM, lastRow, 1).setDataValidation(organRule);
   sheet.getRange(2, CONFIG.RASLO_COLS.DATE_STATUS, lastRow, 1).setNumberFormat('yyyy-MM-dd');
   sheet.getRange(2, CONFIG.RASLO_COLS.EVENT_DATE, lastRow, 1).setNumberFormat('yyyy-MM-dd');
 }
@@ -790,7 +843,8 @@ function importMMCToRASLO() {
       row[CONFIG.MMC_COLS.ISSUE - 1] || '',
       row[CONFIG.MMC_COLS.IMAGING_RATING - 1] || '', '',
       row[CONFIG.MMC_COLS.RATIONALE - 1] || '',
-      caseId
+      caseId,
+      ''  // Organ System — MMC data has no equivalent field
     ]);
     existingKeys[key] = true;
     imported++;
@@ -970,6 +1024,12 @@ function callGemini_(freeformText, apiKeyOverride) {
   var apiKey = apiKeyOverride || getGeminiApiKey_();
   var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=' + apiKey;
 
+  // Organ system options come from the live Reference sheet so the prompt
+  // always matches the dropdown the user maintains.
+  var organSystems = [];
+  try { organSystems = getOrganSystems_(); } catch (e) { }
+  if (organSystems.length === 0) organSystems = ORGAN_SYSTEM_DEFAULTS;
+
   var prompt = 'You are a medical data extraction assistant for a radiology peer review system.\n\n' +
     'Extract the following fields from this freeform text. Return ONLY valid JSON with these exact keys.\n' +
     'If a field cannot be determined, use an empty string.\n\n' +
@@ -981,7 +1041,10 @@ function callGemini_(freeformText, apiKeyOverride) {
     '- study_type: One of: CT, MRI, NM, IR, XR, US, FL, MG\n' +
     '- attributing_physician: Radiologist name (format: "Last, First" from this list: ' + RADIOLOGIST_NAMES.join(', ') + ')\n' +
     '- narrative: Description of the issue. IMPORTANT: Keep under 500 characters. Summarize if the original is longer.\n' +
-    '- imaging_rating: One of: eV1, eV2, eV3, eV4, eV5\n\n' +
+    '- imaging_rating: One of: eV1, eV2, eV3, eV4, eV5\n' +
+    '- organ_system: The anatomic/organ system of the imaging study or finding. Must be exactly one of: ' +
+      organSystems.join(', ') + '. Infer from the body region described (e.g. brain MRI -> Neuro, ' +
+      'chest CT -> Chest, knee XR -> Musculoskeletal). Use empty string only if truly undeterminable.\n\n' +
     'Text to parse:\n"""\n' + freeformText + '\n"""\n\n' +
     'Return ONLY the JSON object, no markdown, no explanation.';
 
@@ -1102,6 +1165,7 @@ function scanGmailForCases() {
         var match = fuzzyMatchRadiologist(attribPhys);
         if (match) attribPhys = match.match;
       }
+      var organSystem = matchOrganSystem_(parsed.organ_system);
 
       var caseId = generateCaseId_();
       var newRow = [
@@ -1111,7 +1175,7 @@ function scanGmailForCases() {
         parsed.study_type || '', attribPhys, '',
         parsed.narrative || '', parsed.imaging_rating || '',
         'From email: "' + subject + '" (' + from + ')', '',
-        caseId
+        caseId, organSystem
       ];
 
       rasloSheet.appendRow(newRow);
@@ -1126,7 +1190,7 @@ function scanGmailForCases() {
 
       doneLabel.addToThread(thread);
 
-      var summary = caseId + ' — ' + (parsed.patient_name || '?') + ' / ' + (parsed.study_type || '?') + ' / ' + (attribPhys || '?');
+      var summary = caseId + ' — ' + (parsed.patient_name || '?') + ' / ' + (parsed.study_type || '?') + ' / ' + (organSystem || '?') + ' / ' + (attribPhys || '?');
       results.push('OK: ' + summary);
       processed++;
 
@@ -1176,7 +1240,7 @@ function parseGeminiInput() {
         parsed.mrn || '', parsed.event_date || '', parsed.study_type || '',
         phys, '', parsed.narrative || '', parsed.imaging_rating || '',
         'Added via Gemini (sheet)', '',
-        caseId
+        caseId, matchOrganSystem_(parsed.organ_system)
       ]);
 
       inputSheet.getRange(i + 1, 2).setValue(JSON.stringify(parsed, null, 2));
@@ -1252,6 +1316,7 @@ function parsePastedTextDirect_(text) {
         var m = fuzzyMatchRadiologist(phys);
         if (m) phys = m.match;
       }
+      var organSystem = matchOrganSystem_(parsed.organ_system);
 
       var caseId = generateCaseId_();
       rasloSheet.appendRow([
@@ -1261,7 +1326,7 @@ function parsePastedTextDirect_(text) {
         parsed.study_type || '', phys, '',
         parsed.narrative || '', parsed.imaging_rating || '',
         'Added via paste dialog', '',
-        caseId
+        caseId, organSystem
       ]);
 
       if (inputSheet) {
@@ -1273,7 +1338,7 @@ function parsePastedTextDirect_(text) {
       }
 
       var summary = caseId + ' — ' + (parsed.patient_name || '?') + ' / ' +
-        (parsed.study_type || '?') + ' / ' + (phys || '?');
+        (parsed.study_type || '?') + ' / ' + (organSystem || '?') + ' / ' + (phys || '?');
       results.push({ ok: true, summary: blockLabel + summary });
       added++;
       debugLog_('parsePastedText', 'Added: ' + summary);
@@ -1416,6 +1481,7 @@ function sendPrimaryReviewsSelected() {
       '{{MRN}}': e.rowData[CONFIG.RASLO_COLS.MRN - 1] || '',
       '{{EVENT_DATE}}': formatDateForDisplay_(e.rowData[CONFIG.RASLO_COLS.EVENT_DATE - 1]),
       '{{STUDY_TYPE}}': e.rowData[CONFIG.RASLO_COLS.STUDY_TYPE - 1] || '',
+      '{{ORGAN_SYSTEM}}': e.rowData[CONFIG.RASLO_COLS.ORGAN_SYSTEM - 1] || '',
       '{{ATTRIB_PHYSICIAN}}': e.phys,
       '{{NARRATIVE}}': e.rowData[CONFIG.RASLO_COLS.NARRATIVE - 1] || '',
       '{{IMAGING_RATING}}': e.rowData[CONFIG.RASLO_COLS.IMAGING_RATING - 1] || '',
@@ -1552,6 +1618,7 @@ function sendSecondaryReviewsSelected() {
       '{{MRN}}': e.rowData[CONFIG.RASLO_COLS.MRN - 1] || '',
       '{{EVENT_DATE}}': formatDateForDisplay_(e.rowData[CONFIG.RASLO_COLS.EVENT_DATE - 1]),
       '{{STUDY_TYPE}}': e.rowData[CONFIG.RASLO_COLS.STUDY_TYPE - 1] || '',
+      '{{ORGAN_SYSTEM}}': e.rowData[CONFIG.RASLO_COLS.ORGAN_SYSTEM - 1] || '',
       '{{ATTRIB_PHYSICIAN}}': e.rowData[CONFIG.RASLO_COLS.ATTRIB_PHYS - 1] || '',
       '{{REVIEWER}}': e.reviewer,
       '{{NARRATIVE}}': e.rowData[CONFIG.RASLO_COLS.NARRATIVE - 1] || '',
@@ -1780,6 +1847,7 @@ function sendPrimaryReviewsAll() {
       '{{MRN}}': data[i][CONFIG.RASLO_COLS.MRN-1]||'',
       '{{EVENT_DATE}}': formatDateForDisplay_(data[i][CONFIG.RASLO_COLS.EVENT_DATE-1]),
       '{{STUDY_TYPE}}': data[i][CONFIG.RASLO_COLS.STUDY_TYPE-1]||'',
+      '{{ORGAN_SYSTEM}}': data[i][CONFIG.RASLO_COLS.ORGAN_SYSTEM-1]||'',
       '{{ATTRIB_PHYSICIAN}}': phys,
       '{{NARRATIVE}}': data[i][CONFIG.RASLO_COLS.NARRATIVE-1]||'',
       '{{IMAGING_RATING}}': data[i][CONFIG.RASLO_COLS.IMAGING_RATING-1]||'',
@@ -1880,6 +1948,7 @@ function sendSecondaryReviewSingle(caseId, reviewerName) {
     '{{MRN}}': rowData[CONFIG.RASLO_COLS.MRN-1]||'',
     '{{EVENT_DATE}}': formatDateForDisplay_(rowData[CONFIG.RASLO_COLS.EVENT_DATE-1]),
     '{{STUDY_TYPE}}': rowData[CONFIG.RASLO_COLS.STUDY_TYPE-1]||'',
+    '{{ORGAN_SYSTEM}}': rowData[CONFIG.RASLO_COLS.ORGAN_SYSTEM-1]||'',
     '{{ATTRIB_PHYSICIAN}}': rowData[CONFIG.RASLO_COLS.ATTRIB_PHYS-1]||'',
     '{{REVIEWER}}': reviewerName,
     '{{NARRATIVE}}': rowData[CONFIG.RASLO_COLS.NARRATIVE-1]||'',
@@ -2376,6 +2445,7 @@ function generateBODSummaryDoc() {
     var rating   = (d[CONFIG.RASLO_COLS.IMAGING_RATING - 1] || '').toString().trim();
     var discussion = (d[CONFIG.RASLO_COLS.DISCUSSION - 1] || '').toString().trim();
     var status   = (d[CONFIG.RASLO_COLS.CASE_STATUS - 1] || '').toString().trim();
+    var organSystem = (d[CONFIG.RASLO_COLS.ORGAN_SYSTEM - 1] || '').toString().trim();
 
     if (c > 0) {
       body.appendPageBreak();
@@ -2389,6 +2459,7 @@ function generateBODSummaryDoc() {
       ['MRN/FIN', mrn],
       ['System', system],
       ['Study Type', studyType],
+      ['Organ System', organSystem || '(not specified)'],
       ['Event Date', evtDate],
       ['Imaging Rating', rating],
       ['Reviewing Physician', reviewer || '(none assigned)'],
@@ -2591,6 +2662,72 @@ function appendNote_(existing, note) {
   var c = (existing||'').toString().trim();
   var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
   return c ? c + '\n[' + ts + '] ' + note : '[' + ts + '] ' + note;
+}
+
+/** Writes a bold header into the given column if it isn't already there. */
+function ensureHeader_(sheet, col, name) {
+  if (sheet.getMaxColumns() < col) sheet.insertColumnsAfter(sheet.getMaxColumns(), col - sheet.getMaxColumns());
+  var cell = sheet.getRange(1, col);
+  if (cell.getValue() !== name) {
+    cell.setValue(name).setFontWeight('bold');
+    debugLog_('ensureHeader_', 'Added "' + name + '" header at column ' + col + ' on ' + sheet.getName());
+  }
+}
+
+/**
+ * Reads the organ system list from Reference!F (header "Systems"),
+ * skipping blanks. Returns [] if the sheet or column is missing.
+ */
+function getOrganSystems_(ss) {
+  ss = ss || getSS_();
+  var ref = ss.getSheetByName(CONFIG.REF_SHEET);
+  if (!ref) return [];
+  var lastRow = ref.getLastRow();
+  if (lastRow < 2 || ref.getMaxColumns() < CONFIG.REF_ORGAN_SYSTEM_COL) return [];
+  var vals = ref.getRange(2, CONFIG.REF_ORGAN_SYSTEM_COL, lastRow - 1, 1).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    var v = (vals[i][0] || '').toString().trim();
+    if (v) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Maps a Gemini-returned organ system onto the Reference list.
+ *   1. exact match ignoring case, punctuation, and "&" vs "and"
+ *   2. an option appearing as whole word(s) in the raw text ("Chest CT" -> Chest)
+ *   3. raw text (3+ chars) as a prefix of an option ("Musculo" -> Musculoskeletal)
+ * Whole-word matching matters because short options like "GI" would otherwise
+ * match inside words like "Angiography". If nothing matches, the raw text is
+ * returned so it lands on the sheet flagged by the validation warning rather
+ * than being silently dropped.
+ */
+function matchOrganSystem_(raw, list) {
+  var s = (raw || '').toString().trim();
+  if (!s) return '';
+  list = list || getOrganSystems_();
+
+  var norm = function(v) {
+    return (v || '').toString().toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+  };
+  var target = norm(s);
+  if (!target) return s;
+
+  for (var i = 0; i < list.length; i++) {
+    if (norm(list[i]) === target) return list[i];
+  }
+  var padded = ' ' + target + ' ';
+  for (var j = 0; j < list.length; j++) {
+    var opt = norm(list[j]);
+    if (opt && padded.indexOf(' ' + opt + ' ') >= 0) return list[j];
+  }
+  if (target.length >= 3) {
+    for (var k = 0; k < list.length; k++) {
+      if (norm(list[k]).indexOf(target) === 0) return list[k];
+    }
+  }
+  return s;
 }
 
 function getOrCreateLabel_(n) {

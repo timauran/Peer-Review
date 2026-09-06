@@ -11,7 +11,7 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 
 | File | Purpose |
 |---|---|
-| `Code.js` | Entire system (v8.3) |
+| `Code.js` | Entire system (v8.4) |
 | `appsscript.json` | Apps Script manifest (V8 runtime) |
 | `.clasp.json` | clasp binding to the Apps Script project |
 
@@ -20,6 +20,17 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 ```bash
 clasp push
 ```
+
+## v8.4 — Organ System tracking (2026-08-07)
+
+Adds an **Organ System** column for more detailed case tracking.
+
+- **Column O (col 15)** on both RASLO Tracking and Archive, appended after Case ID so no existing data shifts — the same convention used when Case ID was added. Run **Setup → Initial Setup** once to add the header to existing sheets (the RASLO sheet's existing rows are untouched).
+- **Options come from the Reference sheet, column F, header `Systems`.** Setup seeds a default list there only if the column is empty and never overwrites it — edit that column to change the dropdown. `setupReferenceSheet_` previously called `sheet.clear()`, which would have wiped a user-maintained list; it now rebuilds only columns A–E.
+- **Dropdown** uses a warn-only validation on Reference!F2:F200, so new entries in the list are picked up without re-running setup, and a value that isn't on the list shows a warning triangle instead of being rejected.
+- **Gemini integration.** The extraction prompt now asks for `organ_system`, constrained to the live Reference list. All three Gemini intake paths (paste dialog, Gmail scan, sheet parse) populate the column. `matchOrganSystem_` normalizes Gemini's answer onto the list — exact match ignoring case/punctuation/`&`-vs-`and`, then whole-word containment (`Chest CT` → `Chest`; whole-word so `Angiography` does not become `GI`), then prefix (`Musculo` → `Musculoskeletal`). An unmatched value is kept on the sheet and flagged rather than dropped.
+- **MMC import** leaves the column blank (MMC data has no equivalent field).
+- **BOD summary doc** shows Organ System in each case table. Custom email templates may use `{{ORGAN_SYSTEM}}`; the default templates are unchanged so existing cases without a value don't print "(not provided)".
 
 ## v8.3 fixes — MMC Export dropping cases (2026-08-07)
 
