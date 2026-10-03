@@ -2855,12 +2855,26 @@ function installTimeTrigger() {
   Logger.log('Trigger installed.');
 }
 
+/**
+ * Trigger handler. Runs under the central Email Automation Hub, which records
+ * successes and errors (never empty scans), alerts if this job errors or stops
+ * running, and can pause it from the hub's Registry sheet. Falls back to a plain
+ * call if the EmailHub library is not attached.
+ */
 function checkForRepliesAuto_() {
+  if (typeof EmailHub === 'undefined') return checkForRepliesAutoInner_();
+  return EmailHub.runJob('peer-review-replies', checkForRepliesAutoInner_, {
+    project: 'Peer Review', handler: 'checkForRepliesAuto_', intervalMin: 30, phi: true
+  });
+}
+
+/** Returns {processed, summary, errors, errorMessages}; summary is counts only (no case IDs). */
+function checkForRepliesAutoInner_() {
   try {
     var ss = getSS_();
     var rasloSheet = ss.getSheetByName(CONFIG.RASLO_SHEET);
     var trackerSheet = ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
-    if (!trackerSheet || !rasloSheet) return;
+    if (!trackerSheet || !rasloSheet) return 0;
 
     var result = checkForRepliesInternal_(rasloSheet, trackerSheet);
     if (result.count > 0) {
@@ -2869,5 +2883,13 @@ function checkForRepliesAuto_() {
     if (result.orphaned.length > 0) {
       debugLog_('checkForRepliesAuto_', 'Orphaned case IDs: ' + result.orphaned.join(', '));
     }
-  } catch (e) { debugError_('checkForRepliesAuto_', e); }
+    return {
+      processed: result.count,
+      summary: 'Captured ' + result.count + ' repl' + (result.count === 1 ? 'y' : 'ies') +
+        (result.orphaned.length ? '; ' + result.orphaned.length + ' orphaned case ID(s)' : '')
+    };
+  } catch (e) {
+    debugError_('checkForRepliesAuto_', e);
+    return { processed: 0, errors: 1, errorMessages: [String(e && e.message || e)] };
+  }
 }
