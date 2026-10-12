@@ -2858,8 +2858,15 @@ function installTimeTrigger() {
 /**
  * Trigger handler. Runs under the central Email Automation Hub, which records
  * successes and errors (never empty scans), alerts if this job errors or stops
- * running, and can pause it from the hub's Registry sheet. Falls back to a plain
- * call if the EmailHub library is not attached.
+ * running, and can pause it from the hub's Registry sheet.
+ *
+ * The typeof guard below only covers the case where the EmailHub entry has
+ * been REMOVED from appsscript.json. It cannot help a user who lacks read
+ * access to the library project: Apps Script resolves library dependencies
+ * at load time, so for that user the whole project fails to load (including
+ * onOpen, so no menu) with "Library with identifier EmailHub is missing".
+ * Every editor of the spreadsheet must therefore have at least Viewer access
+ * to the EmailHub script (library ID in appsscript.json). See README.
  */
 function checkForRepliesAuto_() {
   if (typeof EmailHub === 'undefined') return checkForRepliesAutoInner_();

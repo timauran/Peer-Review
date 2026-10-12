@@ -21,6 +21,32 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 clasp push
 ```
 
+## IDs
+
+| What | ID |
+|---|---|
+| Apps Script project (container-bound) | `1xff8ILyGnzpbqj4PnmgFe6mzIf4O4JyJ2EoQ4GjsMjCgd6Fvv1un5mjs` |
+| Tracking spreadsheet | `1UzWdq8wnh3N4wqVFqT3y-REYv82h3TAtlhlYzSTHKf8` |
+| EmailHub library (dependency) | `1sKT8KV-5rbw-5n8ZwGjukKCgJ0ZRfupm-0mVJGSLF1d6v94hGB2tW5-Q` (development mode, v1) |
+
+## Sharing with other editors — read this first
+
+The script is container-bound, so sharing the spreadsheet shares the code. **But the project depends on the EmailHub library**, and Apps Script resolves library dependencies when the project loads, before any function runs. An editor who cannot read the EmailHub script gets:
+
+```
+Library with identifier EmailHub is missing (perhaps it was deleted, or you don't have read access?)
+```
+
+and *nothing* in the project loads for them — no `onOpen`, so no Peer Review menu. The `typeof EmailHub` fallback in `checkForRepliesAuto_` does not cover this case; it only covers the library entry being removed from the manifest.
+
+**To give someone the menu:** share the EmailHub Apps Script project with them as **Viewer** (open it at `https://script.google.com/d/1sKT8KV-5rbw-5n8ZwGjukKCgJ0ZRfupm-0mVJGSLF1d6v94hGB2tW5-Q/edit` → Share). Sharing a Google Group that contains all reviewers is the easiest way to keep this in sync with spreadsheet access. This exposes only the hub's code, not its data.
+
+Other things every editor should expect:
+
+- **Menu actions run as the clicking user.** Review emails go out from their Gmail, reply scanning reads their inbox, and the first click prompts a one-time authorization. Users outside ra-slo.com will see "Google hasn't verified this app" and must choose **Advanced → Go to RASLO Peer Review (unsafe)**.
+- **The 30-minute reply trigger runs as whoever installed it** (normally the owner), so it keeps working regardless of other editors' library access.
+- Simple triggers like `onOpen` only fire for a signed-in account that is an explicit editor. Anonymous link access and viewer access never show the menu.
+
 ## v8.4 — Organ System tracking (2026-08-07)
 
 Adds an **Organ System** column for more detailed case tracking.
