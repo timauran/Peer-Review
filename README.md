@@ -11,7 +11,8 @@ Google Apps Script (container-bound to the RASLO tracking spreadsheet) that mana
 
 | File | Purpose |
 |---|---|
-| `Code.js` | Entire system (v8.4) |
+| `Code.js` | Entire system (v8.5) |
+| `HIPAA.md` | PHI data flows, safeguards, and required owner actions |
 | `appsscript.json` | Apps Script manifest (V8 runtime) |
 | `.clasp.json` | clasp binding to the Apps Script project |
 
@@ -46,6 +47,18 @@ Other things every editor should expect:
 - **Menu actions run as the clicking user.** Review emails go out from their Gmail, reply scanning reads their inbox, and the first click prompts a one-time authorization. Users outside ra-slo.com will see "Google hasn't verified this app" and must choose **Advanced → Go to RASLO Peer Review (unsafe)**.
 - **The 30-minute reply trigger runs as whoever installed it** (normally the owner), so it keeps working regardless of other editors' library access.
 - Simple triggers like `onOpen` only fire for a signed-in account that is an explicit editor. Anonymous link access and viewer access never show the menu.
+
+## v8.5 — HIPAA technical safeguards (2026-11-09)
+
+See [HIPAA.md](HIPAA.md) for the full picture, including the owner actions that code can't do.
+
+- Gemini extraction moved from the Google AI Studio API, which has no BAA, to Vertex AI under the Google Cloud BAA. It stays off until an owner runs **Setup → Configure Vertex AI (HIPAA)**.
+- PHI emails only go to approved domains (default `ra-slo.com`). Consumer mailboxes are always blocked.
+- Subject lines carry only the Case ID. Reminders carry no patient details.
+- The debug log no longer receives PHI and now records the acting user and each email recipient.
+- BOD summaries omit patient name and MRN by default.
+- "Send ALL Entered as Primary" now asks for confirmation.
+- The manifest declares explicit OAuth scopes, so every user, including the trigger owner, must re-authorize once.
 
 ## v8.4 — Organ System tracking (2026-08-07)
 

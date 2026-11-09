@@ -1,7 +1,31 @@
 
 // ============================================================================
-// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.4
+// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.5
 // Google Apps Script — Full Codebase
+// ============================================================================
+// v8.5 CHANGES (from v8.4) — HIPAA TECHNICAL SAFEGUARDS (see HIPAA.md):
+//   - SECURITY: Gemini now runs only through Vertex AI (aiplatform, regional
+//     endpoint, OAuth bearer token) in a Cloud project under the Google Cloud
+//     BAA. The Google AI Studio endpoint + API key path is removed: it has no
+//     BAA and its terms forbid clinical use. The old key is deleted from
+//     Script Properties when Vertex AI is configured. Extraction is disabled
+//     until an owner runs Setup > Configure Vertex AI (HIPAA).
+//   - SECURITY: Every PHI email goes through sendPhiEmail_, which refuses
+//     recipients outside the approved domains (default ra-slo.com, editable
+//     via Setup > Set Approved Email Domains) and always refuses consumer
+//     mailboxes. Selected-row flows show blocked rows as skipped.
+//   - SECURITY: Email subjects carry only the Case ID, not the patient name.
+//     Reminder bodies no longer include name, MRN, date, or narrative.
+//   - SECURITY: Debug log no longer receives Gemini output, email subjects, or
+//     patient summaries. Gemini error messages never echo model output.
+//     Setup > Redact PHI from Pre-v8.5 Log Entries cleans older rows.
+//   - AUDIT: Log rows record the acting user (new "User" column) and the
+//     recipient of every PHI email. Status Notes entries record "(by user)".
+//   - MINIMUM NECESSARY: BOD summary omits patient name and MRN by default
+//     (CONFIG.BOD_INCLUDE_IDENTIFIERS) and carries a confidentiality banner.
+//   - SAFETY: "Send ALL Entered as Primary" now confirms before bulk sending.
+//   - Manifest declares explicit OAuth scopes (adds cloud-platform for
+//     Vertex AI). Every user, including the trigger owner, must re-authorize.
 // ============================================================================
 // v8.4 CHANGES (from v8.3) — ORGAN SYSTEM TRACKING:
 //   - NEW: "Organ System" column (O, col 15) on RASLO Tracking and Archive.
@@ -113,6 +137,20 @@ var CONFIG = {
 
   SENDER_EMAIL: 'tauran@ra-slo.com',  // reference only — NOT used for reply filtering
   SUBJECT_PREFIX: '[RASLO-PR]',
+
+  // ---- HIPAA safeguards (v8.5) ----
+  // Gemini runs only on Vertex AI. Project ID is a Script Property set via
+  // Setup > Configure Vertex AI; these are the defaults for the other two.
+  VERTEX_DEFAULT_LOCATION: 'us-central1',
+  VERTEX_DEFAULT_MODEL: 'gemini-2.5-pro',
+  // Emails containing PHI may only go to these domains (and their
+  // subdomains). Override with the PHI_ALLOWED_DOMAINS Script Property via
+  // Setup > Set Approved Email Domains.
+  PHI_ALLOWED_DOMAINS_DEFAULT: ['ra-slo.com'],
+  // Minimum necessary: the BOD summary identifies cases by Case ID only.
+  // Set true to also print patient name and MRN.
+  BOD_INCLUDE_IDENTIFIERS: false,
+
   GMAIL_LABEL: 'PeerReview',
   GMAIL_PROCESSED_LABEL: 'PeerReview/Processed',
   GMAIL_INPUT_LABEL: 'PeerReviewInput',
@@ -162,16 +200,34 @@ function getSS_() {
 // 1. DEBUG LOGGING
 // ============================================================================
 
+// HIPAA: the debug log doubles as the script's audit trail (who did what, to
+// which Case ID, when). It must never contain PHI: log Case IDs, counts,
+// lengths, and status codes, never patient names, MRNs, narratives, email
+// subjects, or model output.
+
+var LOG_HEADERS_ = ['Timestamp', 'Function', 'Message', 'Type', 'User'];
+
+/** Email of the person running the script ('' if Google withholds it). */
+function getActorEmail_() {
+  try { return Session.getActiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+
+function getLogSheet_() {
+  var ss = getSS_();
+  var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
+    sheet.getRange(1, 1, 1, LOG_HEADERS_.length).setValues([LOG_HEADERS_]).setFontWeight('bold');
+    sheet.setColumnWidth(3, 600);
+  } else if (sheet.getRange(1, LOG_HEADERS_.length).getValue() !== 'User') {
+    sheet.getRange(1, LOG_HEADERS_.length).setValue('User').setFontWeight('bold');
+  }
+  return sheet;
+}
+
 function debugLog_(functionName, message) {
   try {
-    var ss = getSS_();
-    var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
-    if (!sheet) {
-      sheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
-      sheet.getRange(1, 1, 1, 4).setValues([['Timestamp', 'Function', 'Message', 'Type']]).setFontWeight('bold');
-      sheet.setColumnWidth(3, 600);
-    }
-    sheet.appendRow([new Date(), functionName, String(message), 'INFO']);
+    getLogSheet_().appendRow([new Date(), functionName, String(message), 'INFO', getActorEmail_()]);
     SpreadsheetApp.flush();
   } catch (e) {
     Logger.log('DEBUG LOG FAILED: ' + e.message + ' | ' + message);
@@ -188,14 +244,7 @@ function debugError_(functionName, error) {
     try { fullMsg = JSON.stringify(error); } catch(e2) { fullMsg = String(error); }
   }
   try {
-    var ss = getSS_();
-    var sheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
-    if (!sheet) {
-      sheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
-      sheet.getRange(1, 1, 1, 4).setValues([['Timestamp', 'Function', 'Message', 'Type']]).setFontWeight('bold');
-      sheet.setColumnWidth(3, 600);
-    }
-    sheet.appendRow([new Date(), functionName, fullMsg, 'ERROR']);
+    getLogSheet_().appendRow([new Date(), functionName, fullMsg, 'ERROR', getActorEmail_()]);
     SpreadsheetApp.flush();
   } catch (e2) {
     Logger.log('DEBUG ERROR LOG FAILED: ' + e2.message + ' | ' + fullMsg);
@@ -245,10 +294,13 @@ function onOpen() {
     // ---- Setup ----
     .addSubMenu(ui.createMenu('Setup')
       .addItem('Initial Setup', 'setupSystem')
-      .addItem('Set Gemini API Key', 'promptForApiKey')
+      .addItem('Configure Vertex AI (HIPAA)', 'promptForVertexConfig')
+      .addItem('Set Approved Email Domains', 'promptForAllowedDomains')
       .addItem('Set Template Doc IDs', 'promptForTemplateIds')
       .addItem('Backfill Missing Case IDs', 'backfillCaseIds')
-      .addItem('View Debug Log', 'showDebugLog'))
+      .addSeparator()
+      .addItem('View Debug / Audit Log', 'showDebugLog')
+      .addItem('Redact PHI from Pre-v8.5 Log Entries', 'redactLegacyDebugLog'))
     .addToUi();
 }
 
@@ -263,12 +315,7 @@ function setupSystem() {
   ensureSheet_(ss, CONFIG.GEMINI_INPUT_SHEET, ['Freeform Text', 'Parsed Result', 'Status']);
   ensureSheet_(ss, CONFIG.THREAD_TRACKER_SHEET, ['Case ID', 'Thread ID', 'Type', 'Recipient', 'Date Sent']);
 
-  var debugSheet = ss.getSheetByName(CONFIG.DEBUG_LOG_SHEET);
-  if (!debugSheet) {
-    debugSheet = ss.insertSheet(CONFIG.DEBUG_LOG_SHEET);
-    debugSheet.getRange(1, 1, 1, 4).setValues([['Timestamp', 'Function', 'Message', 'Type']]).setFontWeight('bold');
-    debugSheet.setColumnWidth(3, 600);
-  }
+  getLogSheet_();
 
   // Ensure appended columns exist on sheets created by older versions
   // (Case ID from v4 upgrades, Organ System from pre-v8.4 sheets).
@@ -291,36 +338,97 @@ function setupSystem() {
 
   try { ss.getSheetByName(CONFIG.THREAD_TRACKER_SHEET).hideSheet(); } catch (e) { }
 
-  debugLog_('setupSystem', 'Setup completed (v8.4)');
+  debugLog_('setupSystem', 'Setup completed (v8.5)');
 
   ui.alert('Setup Complete',
-    'System initialized (v8.4).\n\n' +
+    'System initialized (v8.5).\n\n' +
     'Organ System column (O) added. Its dropdown options come from the\n' +
     'Reference sheet, column F ("Systems") — edit that list to change them.\n\n' +
+    'HIPAA: review emails only go to these domains: ' + getPhiAllowedDomains_().join(', ') + '\n' +
+    'Gemini extraction is ' + (getVertexConfig_().projectId ? 'ON (Vertex AI, ' + getVertexConfig_().projectId + ')' :
+      'OFF until you run Setup > Configure Vertex AI (HIPAA)') + '.\n\n' +
     'Gmail labels created:\n' +
     '  - PeerReviewInput (label emails to scan for new cases)\n' +
     '  - PeerReviewInput/Processed (auto-applied after scanning)\n' +
     '  - PeerReview (outgoing review emails)\n' +
     '  - PeerReview/Processed (replies handled)\n\n' +
     'Next steps:\n' +
-    '1. Set Gemini API Key\n' +
-    '2. Create Doc templates (see setup guide)\n' +
-    '3. Set Template Doc IDs\n' +
-    '4. Fill in radiologist emails on Radiologists sheet\n' +
+    '1. Configure Vertex AI (HIPAA) to enable Gemini extraction\n' +
+    '2. Check Approved Email Domains\n' +
+    '3. Optionally create Doc templates and set Template Doc IDs\n' +
+    '4. Fill in radiologist work emails on the Radiologists sheet\n' +
     '5. If upgrading from v4, run Setup > Backfill Missing Case IDs\n' +
-    '6. Install Auto-Reply Checker for background reply scanning',
+    '6. Install Auto-Reply Checker for background reply scanning\n' +
+    '7. If upgrading from before v8.5, run Setup > Redact PHI from Pre-v8.5 Log Entries',
     ui.ButtonSet.OK);
 }
 
-function promptForApiKey() {
+/** Menu: Setup > Set Approved Email Domains. */
+function promptForAllowedDomains() {
   var ui = SpreadsheetApp.getUi();
-  var result = ui.prompt('Gemini API Key', 'Enter your Gemini API key:', ui.ButtonSet.OK_CANCEL);
-  if (result.getSelectedButton() === ui.Button.OK) {
-    var key = result.getResponseText().trim();
-    PropertiesService.getScriptProperties().setProperty('GEMINI_API_KEY', key);
-    debugLog_('promptForApiKey', 'API key saved (length: ' + key.length + ')');
-    ui.alert('API key saved.');
+  var cur = getPhiAllowedDomains_();
+  var r = ui.prompt('Approved Email Domains',
+    'Review emails contain PHI, so they are only sent to these domains.\n' +
+    'Only list domains covered by your Google Workspace BAA or a signed BAA with that organization.\n\n' +
+    'Current: ' + cur.join(', ') + '\n\nEnter a comma-separated list (blank keeps the current list):',
+    ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  var text = r.getResponseText().trim();
+  if (!text) return;
+
+  var domains = text.split(/[,\s;]+/).map(function(d) { return d.trim().toLowerCase().replace(/^@/, ''); })
+    .filter(Boolean);
+  var bad = domains.filter(function(d) { return !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d); });
+  if (bad.length || domains.length === 0) {
+    ui.alert('Invalid domain', 'These are not valid domains: ' + bad.join(', '), ui.ButtonSet.OK);
+    return;
   }
+  var consumer = domains.filter(function(d) { return CONSUMER_EMAIL_DOMAINS_.indexOf(d) >= 0; });
+  if (consumer.length) {
+    ui.alert('Not allowed', 'Consumer email domains can never receive PHI from this system: ' +
+      consumer.join(', '), ui.ButtonSet.OK);
+    return;
+  }
+  PropertiesService.getScriptProperties().setProperty('PHI_ALLOWED_DOMAINS', domains.join(','));
+  debugLog_('promptForAllowedDomains', 'Approved PHI email domains set to: ' + domains.join(', '));
+  ui.alert('Saved', 'Approved domains: ' + domains.join(', '), ui.ButtonSet.OK);
+}
+
+/**
+ * Menu: Setup > Redact PHI from Pre-v8.5 Log Entries.
+ * Versions before v8.5 wrote Gemini output, email subjects, and patient
+ * summaries into the debug log. This blanks the Message cell of every row
+ * from the functions that did so, keeping timestamp/function/type/user as
+ * the audit record. (Rows those functions write in v8.5+ are PHI-free, so
+ * redacting them too loses only diagnostic detail.)
+ */
+function redactLegacyDebugLog() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = getSS_().getSheetByName(CONFIG.DEBUG_LOG_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) { ui.alert('The debug log is empty.'); return; }
+
+  var leaky = { callGemini_: 1, scanGmailForCases: 1, parsePastedText: 1, getGeminiApiKey_: 1, promptForApiKey: 1 };
+  var n = sheet.getLastRow() - 1;
+  var vals = sheet.getRange(2, 2, n, 2).getValues();  // Function, Message
+  var hits = 0;
+  for (var i = 0; i < n; i++) {
+    if (leaky[vals[i][0]] && vals[i][1] !== '[redacted]') hits++;
+  }
+  if (hits === 0) { ui.alert('Nothing to redact', 'No pre-v8.5 entries from PHI-logging functions were found.', ui.ButtonSet.OK); return; }
+
+  if (ui.alert('Redact ' + hits + ' log entries?',
+      'The Message text of ' + hits + ' rows will be replaced with "[redacted]". ' +
+      'Timestamps and function names stay. This cannot be undone except through the sheet\'s version history.',
+      ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+  var out = [];
+  for (var j = 0; j < n; j++) {
+    out.push([leaky[vals[j][0]] ? '[redacted]' : vals[j][1]]);
+  }
+  sheet.getRange(2, 3, n, 1).setValues(out);
+  debugLog_('redactLegacyDebugLog', 'Redacted ' + hits + ' pre-v8.5 log entries');
+  ui.alert('Done', hits + ' entries redacted. Version history of the spreadsheet still holds the old text; ' +
+    'see HIPAA.md in the repo for how to handle that.', ui.ButtonSet.OK);
 }
 
 function promptForTemplateIds() {
@@ -431,7 +539,7 @@ function showInstructions() {
     '<p>When the secondary reviewer replies, status auto-updates to <span class="status">Back from secondary</span>. ' +
     'Set status to <span class="status">Pending BOD vote</span> when you are ready to bring it to the Board.</p>' +
     '<ol>' +
-    '<li><b>Generate summary:</b> Click <b>Peer Review → Generate BOD Summary Document</b>. This creates a Google Doc summarizing every "Pending BOD vote" case with demographics, narrative, discussion, and a blank "BOD Decision" section with rating checkboxes. Share or email this doc to partners before the meeting.</li>' +
+    '<li><b>Generate summary:</b> Click <b>Peer Review → Generate BOD Summary Document</b>. This creates a Google Doc summarizing every "Pending BOD vote" case by Case ID, with study details, narrative, discussion, and a blank "BOD Decision" section with rating checkboxes. Patient name and MRN are left out (HIPAA minimum necessary). Share the doc with partners using Google Drive sharing to RASLO accounts only. Do not email it as an attachment.</li>' +
     '<li><b>Tip:</b> If you want to include specific cases regardless of status, select those rows first — the generator will use your selection.</li>' +
     '<li><b>After the vote:</b> Set status to <span class="status">Completed</span>, then click <b>Archive Completed Cases</b> to move them off the active tracker.</li>' +
     '</ol>' +
@@ -452,10 +560,21 @@ function showInstructions() {
     'The reminder goes to the appropriate person (attributing physician for primary, reviewing physician for secondary) ' +
     'and includes how many days have elapsed since the review was sent. Each reminder is logged in Status Notes.</p>' +
 
+    '<h2>HIPAA RULES BUILT INTO THIS SYSTEM</h2>' +
+    '<ul>' +
+    '<li><b>Email only goes to approved domains</b> (' + escapeHtml_(getPhiAllowedDomains_().join(', ')) + '). ' +
+    'Rows whose radiologist email is elsewhere are skipped. Personal Gmail, Yahoo, and similar addresses are always blocked.</li>' +
+    '<li><b>Subject lines carry only the Case ID</b>, never the patient name. Reminders contain no patient details.</li>' +
+    '<li><b>Gemini runs only on Vertex AI</b> under the Google Cloud BAA. Gemini menu items show an error until an owner completes <b>Setup → Configure Vertex AI (HIPAA)</b>.</li>' +
+    '<li><b>The debug log is also the audit log.</b> It records who did what to which Case ID, and never patient details.</li>' +
+    '<li><b>BOD documents omit patient name and MRN.</b> Share them through Drive with RASLO accounts only.</li>' +
+    '<li><b>Only RASLO workforce accounts may edit this spreadsheet.</b> Do not share it with personal accounts.</li>' +
+    '</ul>' +
+
     '<h2>SETUP CHECKLIST</h2>' +
     '<ol>' +
     '<li>Run <b>Setup → Initial Setup</b></li>' +
-    '<li>Set <b>Gemini API Key</b></li>' +
+    '<li>Run <b>Setup → Configure Vertex AI (HIPAA)</b> and check <b>Approved Email Domains</b></li>' +
     '<li>Optionally set <b>Template Doc IDs</b></li>' +
     '<li>Fill in radiologist <b>emails</b> on the Radiologists sheet</li>' +
     '<li>Run <b>Install Auto-Reply Checker</b></li>' +
@@ -1001,28 +1120,96 @@ function exportToMMC() {
 
 
 // ============================================================================
-// 8. GEMINI API
+// 8. GEMINI VIA VERTEX AI (HIPAA)
 // ============================================================================
+//
+// PHI goes to Gemini only through Vertex AI, in a Google Cloud project that
+// the organization's Google Cloud BAA covers. The earlier Google AI Studio
+// endpoint (generativelanguage.googleapis.com with an API key) has no BAA,
+// and its terms forbid clinical use, so that path was removed entirely.
+// Calls authenticate with the user's OAuth token, so no key appears in a URL.
+// A regional endpoint keeps processing in the configured region.
 
-function getGeminiApiKey_() {
-  debugLog_('getGeminiApiKey_', 'Reading API key...');
-  var key = null;
-  try {
-    key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-    debugLog_('getGeminiApiKey_', 'Key exists: ' + (key ? 'yes, length ' + key.length : 'NO'));
-  } catch (e) {
-    debugError_('getGeminiApiKey_', 'PropertiesService FAILED: ' + e.message);
-    throw new Error('PropertiesService error: ' + e.message);
-  }
-  if (!key) throw new Error('Gemini API key not set. Use Peer Review > Set Gemini API Key.');
-  return key;
+function getVertexConfig_() {
+  var props = PropertiesService.getScriptProperties();
+  return {
+    projectId: (props.getProperty('VERTEX_PROJECT_ID') || '').trim(),
+    location: (props.getProperty('VERTEX_LOCATION') || CONFIG.VERTEX_DEFAULT_LOCATION).trim(),
+    model: (props.getProperty('VERTEX_MODEL') || CONFIG.VERTEX_DEFAULT_MODEL).trim()
+  };
 }
 
-function callGemini_(freeformText, apiKeyOverride) {
+/** Menu: Setup > Configure Vertex AI (HIPAA). */
+function promptForVertexConfig() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var cur = getVertexConfig_();
+
+  var ack = ui.alert('Configure Vertex AI (HIPAA)',
+    'Gemini extraction sends patient information to Google Cloud.\n\n' +
+    'Only continue if ALL of these are true:\n' +
+    '  1. The Cloud project is under your organization\'s signed Google Cloud BAA.\n' +
+    '  2. The Vertex AI API is enabled in that project.\n' +
+    '  3. Everyone who uses the Gemini menu items has the "Vertex AI User" role there.\n\n' +
+    'Continue?', ui.ButtonSet.YES_NO);
+  if (ack !== ui.Button.YES) return;
+
+  var r1 = ui.prompt('Google Cloud Project ID',
+    'Project ID (not the number), e.g. raslo-peer-review.' +
+    (cur.projectId ? '\nCurrent: ' + cur.projectId : ''), ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var projectId = r1.getResponseText().trim() || cur.projectId;
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) {
+    ui.alert('Invalid project ID', 'Project IDs are 6-30 lowercase letters, digits, or hyphens.', ui.ButtonSet.OK);
+    return;
+  }
+
+  var r2 = ui.prompt('Region',
+    'Regional location for processing (leave blank for ' + cur.location + ').\n' +
+    'Use a US region such as us-central1 or us-west1. "global" is not allowed for PHI.', ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var location = r2.getResponseText().trim() || cur.location;
+  if (!/^[a-z]+-[a-z]+[0-9]+$/.test(location)) {
+    ui.alert('Invalid region', 'Enter a regional location like us-central1.', ui.ButtonSet.OK);
+    return;
+  }
+
+  var r3 = ui.prompt('Gemini model',
+    'Model ID (leave blank for ' + cur.model + ').', ui.ButtonSet.OK_CANCEL);
+  if (r3.getSelectedButton() !== ui.Button.OK) return;
+  var model = r3.getResponseText().trim() || cur.model;
+  if (!/^[a-z0-9][a-z0-9.\-]*$/.test(model)) {
+    ui.alert('Invalid model ID', 'Model IDs look like gemini-2.5-pro.', ui.ButtonSet.OK);
+    return;
+  }
+
+  props.setProperty('VERTEX_PROJECT_ID', projectId);
+  props.setProperty('VERTEX_LOCATION', location);
+  props.setProperty('VERTEX_MODEL', model);
+  // The AI Studio key is no longer used anywhere. Remove it so it can't be
+  // copied out of Project Settings and used against PHI elsewhere.
+  var hadKey = !!props.getProperty('GEMINI_API_KEY');
+  props.deleteProperty('GEMINI_API_KEY');
+
+  debugLog_('promptForVertexConfig', 'Vertex AI configured: project=' + projectId + ', location=' + location +
+    ', model=' + model + (hadKey ? '; legacy AI Studio API key deleted' : ''));
+  ui.alert('Vertex AI configured',
+    'Gemini extraction will use project ' + projectId + ' in ' + location + '.' +
+    (hadKey ? '\n\nThe old Gemini API key was deleted from Script Properties.' : '') +
+    '\n\nTip: try "Paste New Case" with dummy text first to confirm access.', ui.ButtonSet.OK);
+}
+
+function callGemini_(freeformText) {
   debugLog_('callGemini_', 'START. Input length: ' + (freeformText ? freeformText.length : 'null'));
 
-  var apiKey = apiKeyOverride || getGeminiApiKey_();
-  var url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=' + apiKey;
+  var cfg = getVertexConfig_();
+  if (!cfg.projectId) {
+    throw new Error('Gemini extraction is disabled until Vertex AI is configured. An owner must run ' +
+      'Peer Review > Setup > Configure Vertex AI (HIPAA). Patient data is never sent to AI services without a BAA.');
+  }
+  var url = 'https://' + cfg.location + '-aiplatform.googleapis.com/v1/projects/' +
+    encodeURIComponent(cfg.projectId) + '/locations/' + cfg.location +
+    '/publishers/google/models/' + encodeURIComponent(cfg.model) + ':generateContent';
 
   // Organ system options come from the live Reference sheet so the prompt
   // always matches the dropdown the user maintains.
@@ -1049,70 +1236,77 @@ function callGemini_(freeformText, apiKeyOverride) {
     'Return ONLY the JSON object, no markdown, no explanation.';
 
   var payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.1, maxOutputTokens: 16384 }
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.1, maxOutputTokens: 16384, responseMimeType: 'application/json' }
   };
 
-  var options = { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true };
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
 
+  // HIPAA: nothing below logs or throws the model's output or the request
+  // text. Error messages carry only status codes, API error text (which
+  // describes configuration, not content), and lengths.
   var response, responseText;
   try {
-    debugLog_('callGemini_', 'Calling API...');
     response = UrlFetchApp.fetch(url, options);
     responseText = response.getContentText();
     debugLog_('callGemini_', 'HTTP ' + response.getResponseCode() + ', length: ' + responseText.length);
   } catch (fetchErr) {
     debugError_('callGemini_', 'FETCH FAILED: ' + fetchErr.message);
-    throw new Error('FETCH FAILED: ' + fetchErr.message);
+    throw new Error('Could not reach Vertex AI: ' + fetchErr.message);
   }
 
-  if (response.getResponseCode() !== 200) {
-    var errMsg = 'GEMINI HTTP ' + response.getResponseCode() + ': ' + responseText.substring(0, 1000);
+  var result = null;
+  try { result = JSON.parse(responseText); } catch (e) { }
+
+  var code = response.getResponseCode();
+  if (code !== 200) {
+    var apiErr = result && result.error ? ((result.error.status || '') + ' ' + (result.error.message || '')).trim() : '';
+    var hint = '';
+    if (code === 403) {
+      hint = ' Check that the Vertex AI API is enabled in project ' + cfg.projectId +
+        ' and that your account has the "Vertex AI User" role there.';
+    } else if (code === 404) {
+      hint = ' Check the model ID (' + cfg.model + ') and region (' + cfg.location + ').';
+    }
+    var errMsg = 'Vertex AI HTTP ' + code + (apiErr ? ': ' + apiErr.substring(0, 300) : '') + '.' + hint;
     debugError_('callGemini_', errMsg);
     throw new Error(errMsg);
   }
 
-  var result;
-  try { result = JSON.parse(responseText); } catch (e) {
-    debugError_('callGemini_', 'Not JSON: ' + responseText.substring(0, 500));
-    throw new Error('Response not JSON: ' + responseText.substring(0, 500));
-  }
-
-  if (result.error) {
-    debugError_('callGemini_', 'API error: ' + JSON.stringify(result.error));
-    throw new Error('GEMINI ERROR: ' + JSON.stringify(result.error));
+  if (!result) {
+    debugError_('callGemini_', 'Response body was not JSON (' + responseText.length + ' chars)');
+    throw new Error('Vertex AI returned a response that was not JSON.');
   }
 
   if (!result.candidates || !result.candidates[0] || !result.candidates[0].content) {
-    debugError_('callGemini_', 'No candidates: ' + JSON.stringify(result).substring(0, 500));
-    throw new Error('No candidates: ' + JSON.stringify(result).substring(0, 500));
+    var why = (result.promptFeedback && result.promptFeedback.blockReason) ||
+      (result.candidates && result.candidates[0] && result.candidates[0].finishReason) || 'unknown';
+    debugError_('callGemini_', 'No usable candidate (reason: ' + why + ')');
+    throw new Error('Gemini returned no answer (reason: ' + why + ').');
   }
 
-  var parts = result.candidates[0].content.parts;
+  var parts = result.candidates[0].content.parts || [];
   var text = '';
-  debugLog_('callGemini_', 'Response has ' + parts.length + ' parts');
   for (var p = 0; p < parts.length; p++) {
-    var isThought = parts[p].thought === true;
-    debugLog_('callGemini_', 'Part ' + p + ': thought=' + isThought + ', length=' + (parts[p].text ? parts[p].text.length : 0));
-    if (!isThought && parts[p].text) {
-      text = parts[p].text;
-    }
+    if (parts[p].thought !== true && parts[p].text) text = parts[p].text;
   }
-  if (!text) {
-    text = parts[parts.length - 1].text || '';
-    debugLog_('callGemini_', 'Fallback to last part');
-  }
+  if (!text && parts.length) text = parts[parts.length - 1].text || '';
 
   text = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-  debugLog_('callGemini_', 'Final output: ' + text.substring(0, 500));
 
   try {
     var parsed = JSON.parse(text);
-    debugLog_('callGemini_', 'Parsed OK');
+    debugLog_('callGemini_', 'Parsed OK (' + text.length + ' chars)');
     return parsed;
   } catch (jsonErr) {
-    debugError_('callGemini_', 'Output not JSON: ' + text.substring(0, 500));
-    throw new Error('Output not JSON: ' + text.substring(0, 500));
+    debugError_('callGemini_', 'Model output was not valid JSON (' + text.length + ' chars)');
+    throw new Error('Gemini output was not valid JSON. Try again, or enter the case manually.');
   }
 }
 
@@ -1155,7 +1349,8 @@ function scanGmailForCases() {
     var from = msg.getFrom();
     var date = msg.getDate();
 
-    debugLog_('scanGmailForCases', 'Processing email: "' + subject + '" from ' + from + ' (' + body.length + ' chars)');
+    // HIPAA: subjects can name the patient, so the log gets only position and size.
+    debugLog_('scanGmailForCases', 'Processing labeled email ' + (t + 1) + ' of ' + threads.length + ' (' + body.length + ' chars)');
 
     try {
       var parsed = callGemini_(body);
@@ -1195,7 +1390,7 @@ function scanGmailForCases() {
       processed++;
 
     } catch (e) {
-      debugError_('scanGmailForCases', 'Error on "' + subject + '": ' + e.message);
+      debugError_('scanGmailForCases', 'Error on labeled email ' + (t + 1) + ' of ' + threads.length + ': ' + e.message);
       errors.push('"' + subject + '": ' + e.message);
       doneLabel.addToThread(thread);
     }
@@ -1341,7 +1536,7 @@ function parsePastedTextDirect_(text) {
         (parsed.study_type || '?') + ' / ' + (organSystem || '?') + ' / ' + (phys || '?');
       results.push({ ok: true, summary: blockLabel + summary });
       added++;
-      debugLog_('parsePastedText', 'Added: ' + summary);
+      debugLog_('parsePastedText', 'Added case ' + caseId);
 
     } catch (e) {
       results.push({ ok: false, error: blockLabel + e.message });
@@ -1443,6 +1638,10 @@ function sendPrimaryReviewsSelected() {
       skippedEmail.push('Row ' + rowNum + ' (' + pat + '): no email for "' + phys + '"');
       continue;
     }
+    if (!isPhiRecipientAllowed_(email)) {
+      skippedEmail.push('Row ' + rowNum + ' (' + pat + '): ' + email + ' is not an approved domain');
+      continue;
+    }
 
     if (!caseId) {
       caseId = generateCaseId_();
@@ -1487,18 +1686,20 @@ function sendPrimaryReviewsSelected() {
       '{{IMAGING_RATING}}': e.rowData[CONFIG.RASLO_COLS.IMAGING_RATING - 1] || '',
       '{{CASE_ID}}': e.caseId
     });
-    var subject = CONFIG.SUBJECT_PREFIX + ' Primary Review — ' + e.pat + ' [' + e.caseId + ']';
+    // HIPAA: subject lines show in notifications and lock screens, so they
+    // carry only the Case ID, never the patient name.
+    var subject = CONFIG.SUBJECT_PREFIX + ' Primary Review [' + e.caseId + ']';
 
     try {
-      GmailApp.sendEmail(e.email, subject, body, { name: 'RASLO Peer Review' });
+      sendPhiEmail_(e.email, subject, body);
       Utilities.sleep(2000);
       var threads = GmailApp.search('subject:"[' + e.caseId + ']" from:me newer_than:1d', 0, 1);
       if (threads.length > 0) {
         trackerSheet.appendRow([e.caseId, threads[0].getId(), 'primary', e.email, new Date()]);
         getOrCreateLabel_(CONFIG.GMAIL_LABEL).addToThread(threads[0]);
-        debugLog_('sendPrimaryReviewsSelected', e.caseId + ': sent, thread tracked, PeerReview label applied');
+        debugLog_('sendPrimaryReviewsSelected', e.caseId + ': sent to ' + e.email + ', thread tracked, PeerReview label applied');
       } else {
-        debugLog_('sendPrimaryReviewsSelected', e.caseId + ': sent but Gmail search could not find thread — PeerReview label NOT applied. Reply tracking may not work for this case.');
+        debugLog_('sendPrimaryReviewsSelected', e.caseId + ': sent to ' + e.email + ' but Gmail search could not find thread — PeerReview label NOT applied. Reply tracking may not work for this case.');
       }
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.CASE_STATUS).setValue('Out for primary review');
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.DATE_STATUS).setValue(new Date());
@@ -1578,6 +1779,10 @@ function sendSecondaryReviewsSelected() {
       skippedReviewer.push('Row ' + rowNum + ' (' + pat + '): no email for "' + reviewer + '"');
       continue;
     }
+    if (!isPhiRecipientAllowed_(email)) {
+      skippedReviewer.push('Row ' + rowNum + ' (' + pat + '): ' + email + ' is not an approved domain');
+      continue;
+    }
 
     if (!caseId) {
       caseId = generateCaseId_();
@@ -1626,18 +1831,18 @@ function sendSecondaryReviewsSelected() {
       '{{DISCUSSION}}': e.rowData[CONFIG.RASLO_COLS.DISCUSSION - 1] || '',
       '{{CASE_ID}}': e.caseId
     });
-    var subject = CONFIG.SUBJECT_PREFIX + ' Secondary Review \u2014 ' + e.pat + ' [' + e.caseId + ']';
+    var subject = CONFIG.SUBJECT_PREFIX + ' Secondary Review [' + e.caseId + ']';
 
     try {
-      GmailApp.sendEmail(e.email, subject, body, { name: 'RASLO Peer Review' });
+      sendPhiEmail_(e.email, subject, body);
       Utilities.sleep(2000);
       var threads = GmailApp.search('subject:"[' + e.caseId + ']" "Secondary Review" from:me newer_than:1d', 0, 1);
       if (threads.length > 0) {
         trackerSheet.appendRow([e.caseId, threads[0].getId(), 'secondary', e.email, new Date()]);
         getOrCreateLabel_(CONFIG.GMAIL_LABEL).addToThread(threads[0]);
-        debugLog_('sendSecondaryReviewsSelected', e.caseId + ': sent, thread tracked');
+        debugLog_('sendSecondaryReviewsSelected', e.caseId + ': sent to ' + e.email + ', thread tracked');
       } else {
-        debugLog_('sendSecondaryReviewsSelected', e.caseId + ': sent but thread not found by Gmail search');
+        debugLog_('sendSecondaryReviewsSelected', e.caseId + ': sent to ' + e.email + ' but thread not found by Gmail search');
       }
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.CASE_STATUS).setValue('Out for secondary review');
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.DATE_STATUS).setValue(new Date());
@@ -1720,6 +1925,10 @@ function sendRemindersSelected() {
       skipped.push('Row ' + rowNum + ' (' + pat + '): no email for "' + recipient + '"');
       continue;
     }
+    if (!isPhiRecipientAllowed_(email)) {
+      skipped.push('Row ' + rowNum + ' (' + pat + '): ' + email + ' is not an approved domain');
+      continue;
+    }
 
     var daysSince = '';
     if (dateSent instanceof Date) {
@@ -1756,14 +1965,13 @@ function sendRemindersSelected() {
   for (var i = 0; i < eligible.length; i++) {
     var e = eligible[i];
     var studyType = (e.rowData[CONFIG.RASLO_COLS.STUDY_TYPE - 1] || '').toString().trim();
-    var evtDate = formatDateForDisplay_(e.rowData[CONFIG.RASLO_COLS.EVENT_DATE - 1]);
-    var narrative = (e.rowData[CONFIG.RASLO_COLS.NARRATIVE - 1] || '').toString().trim();
-    var rating = (e.rowData[CONFIG.RASLO_COLS.IMAGING_RATING - 1] || '').toString().trim();
     var system = (e.rowData[CONFIG.RASLO_COLS.SYSTEM - 1] || '').toString().trim();
 
     var typeLabel = e.reviewType === 'primary' ? 'Primary' : 'Secondary';
-    var subject = CONFIG.SUBJECT_PREFIX + ' REMINDER: ' + typeLabel + ' Review \u2014 ' + e.pat + ' [' + e.caseId + ']';
+    var subject = CONFIG.SUBJECT_PREFIX + ' REMINDER: ' + typeLabel + ' Review [' + e.caseId + ']';
 
+    // HIPAA minimum necessary: a reminder only points back to the original
+    // review email, so it carries no patient name, MRN, date, or narrative.
     var bodyLines = [
       'RASLO PEER REVIEW \u2014 REMINDER',
       '',
@@ -1771,34 +1979,25 @@ function sendRemindersSelected() {
       '',
       'Dear ' + e.recipient + ',',
       '',
-      'This is a reminder that a ' + typeLabel.toLowerCase() + ' review response is pending for the following case.',
+      'This is a reminder that a ' + typeLabel.toLowerCase() + ' review response is pending for case ' + e.caseId +
+        ' (' + [system, studyType].filter(Boolean).join(' ') + ').',
       e.daysSince ? 'The review was sent ' + e.daysSince + '.' : '',
       '',
-      'CASE DETAILS:',
-      'Patient: ' + e.pat,
-      'System: ' + system,
-      'MRN/FIN: ' + (e.rowData[CONFIG.RASLO_COLS.MRN - 1] || ''),
-      'Event Date: ' + evtDate,
-      'Study Type: ' + studyType,
-      'Imaging Rating: ' + rating,
-      '',
-      'NARRATIVE:',
-      narrative || '(see original email)',
-      '',
-      'Please reply to the original review email with your comments.',
+      'Search your email for ' + e.caseId + ' to find the original review request, which has the case details,',
+      'and reply to it with your comments.',
       '',
       '\u2014 RASLO Peer Review System'
     ];
 
     try {
-      GmailApp.sendEmail(e.email, subject, bodyLines.join('\n'), { name: 'RASLO Peer Review' });
+      sendPhiEmail_(e.email, subject, bodyLines.join('\n'));
 
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.STATUS_NOTES).setValue(
         appendNote_(e.rowData[CONFIG.RASLO_COLS.STATUS_NOTES - 1],
           'Reminder sent to ' + e.recipient + ' (' + typeLabel.toLowerCase() + ' review)'));
       rasloSheet.getRange(e.rowNum, CONFIG.RASLO_COLS.DATE_STATUS).setValue(new Date());
       sent++;
-      debugLog_('sendRemindersSelected', e.caseId + ': reminder sent to ' + e.recipient);
+      debugLog_('sendRemindersSelected', e.caseId + ': reminder sent to ' + e.recipient + ' <' + e.email + '>');
     } catch (err) {
       errors.push(e.caseId + ': ' + err.message);
       debugError_('sendRemindersSelected', e.caseId + ': ' + err.message);
@@ -1828,11 +2027,23 @@ function sendPrimaryReviewsAll() {
   var data = rasloSheet.getDataRange().getValues();
   var sent = 0, errors = [];
 
+  // Bulk PHI disclosure: always confirm the count first.
+  var pending = 0;
+  for (var k = 1; k < data.length; k++) {
+    if ((data[k][CONFIG.RASLO_COLS.CASE_STATUS-1]||'').toString().trim() === 'Entered') pending++;
+  }
+  if (pending === 0) { ui.alert('Nothing to Send', 'No cases have status "Entered".', ui.ButtonSet.OK); return; }
+  if (ui.alert('Send ALL Primary Reviews',
+      'Send primary review emails for all ' + pending + ' case(s) with status "Entered"?\n\n' +
+      'Each email contains patient information. Only approved domains (' + getPhiAllowedDomains_().join(', ') +
+      ') will receive one.', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
   for (var i = 1; i < data.length; i++) {
     if ((data[i][CONFIG.RASLO_COLS.CASE_STATUS-1]||'').toString().trim() !== 'Entered') continue;
     var phys = (data[i][CONFIG.RASLO_COLS.ATTRIB_PHYS-1]||'').toString().trim();
     var email = radEmails[phys];
     if (!email) { errors.push('Row ' + (i+1) + ': No email for "' + phys + '"'); continue; }
+    if (!isPhiRecipientAllowed_(email)) { errors.push('Row ' + (i+1) + ': ' + email + ' is not an approved domain'); continue; }
 
     var pat = data[i][CONFIG.RASLO_COLS.PATIENT_NAME-1] || '';
     var rowNum = i + 1;
@@ -1853,18 +2064,18 @@ function sendPrimaryReviewsAll() {
       '{{IMAGING_RATING}}': data[i][CONFIG.RASLO_COLS.IMAGING_RATING-1]||'',
       '{{CASE_ID}}': caseId
     });
-    var subject = CONFIG.SUBJECT_PREFIX + ' Primary Review — ' + pat + ' [' + caseId + ']';
+    var subject = CONFIG.SUBJECT_PREFIX + ' Primary Review [' + caseId + ']';
 
     try {
-      GmailApp.sendEmail(email, subject, body, { name: 'RASLO Peer Review' });
+      sendPhiEmail_(email, subject, body);
       Utilities.sleep(2000);
       var threads = GmailApp.search('subject:"[' + caseId + ']" from:me newer_than:1d', 0, 1);
       if (threads.length > 0) {
         trackerSheet.appendRow([caseId, threads[0].getId(), 'primary', email, new Date()]);
         getOrCreateLabel_(CONFIG.GMAIL_LABEL).addToThread(threads[0]);
-        debugLog_('sendPrimaryReviewsAll', caseId + ': sent, thread tracked');
+        debugLog_('sendPrimaryReviewsAll', caseId + ': sent to ' + email + ', thread tracked');
       } else {
-        debugLog_('sendPrimaryReviewsAll', caseId + ': sent but thread not found by Gmail search');
+        debugLog_('sendPrimaryReviewsAll', caseId + ': sent to ' + email + ' but thread not found by Gmail search');
       }
       rasloSheet.getRange(rowNum, CONFIG.RASLO_COLS.CASE_STATUS).setValue('Out for primary review');
       rasloSheet.getRange(rowNum, CONFIG.RASLO_COLS.DATE_STATUS).setValue(new Date());
@@ -1956,17 +2167,17 @@ function sendSecondaryReviewSingle(caseId, reviewerName) {
     '{{DISCUSSION}}': rowData[CONFIG.RASLO_COLS.DISCUSSION-1]||'',
     '{{CASE_ID}}': caseId
   });
-  var subject = CONFIG.SUBJECT_PREFIX + ' Secondary Review — ' + pat + ' [' + caseId + ']';
-  GmailApp.sendEmail(email, subject, body, { name: 'RASLO Peer Review' });
+  var subject = CONFIG.SUBJECT_PREFIX + ' Secondary Review [' + caseId + ']';
+  sendPhiEmail_(email, subject, body);
 
   Utilities.sleep(2000);
   var threads = GmailApp.search('subject:"[' + caseId + ']" "Secondary Review" from:me newer_than:1d', 0, 1);
   if (threads.length > 0) {
     trackerSheet.appendRow([caseId, threads[0].getId(), 'secondary', email, new Date()]);
     getOrCreateLabel_(CONFIG.GMAIL_LABEL).addToThread(threads[0]);
-    debugLog_('sendSecondaryReviewSingle', caseId + ': sent, thread tracked');
+    debugLog_('sendSecondaryReviewSingle', caseId + ': sent to ' + email + ', thread tracked');
   } else {
-    debugLog_('sendSecondaryReviewSingle', caseId + ': sent but thread not found by Gmail search');
+    debugLog_('sendSecondaryReviewSingle', caseId + ': sent to ' + email + ' but thread not found by Gmail search');
   }
 
   rasloSheet.getRange(rowNum, CONFIG.RASLO_COLS.CASE_STATUS).setValue('Out for secondary review');
@@ -2429,6 +2640,16 @@ function generateBODSummaryDoc() {
   var countLine = body.appendParagraph(cases.length + ' case' + (cases.length > 1 ? 's' : '') + ' for review');
   countLine.setAttributes(subtitleStyle);
 
+  // HIPAA notice. Narrative and discussion text can still contain PHI even
+  // when names and MRNs are omitted.
+  var phiStyle = {};
+  phiStyle[DocumentApp.Attribute.FONT_SIZE] = 10;
+  phiStyle[DocumentApp.Attribute.BOLD] = true;
+  phiStyle[DocumentApp.Attribute.FOREGROUND_COLOR] = '#c5221f';
+  phiStyle[DocumentApp.Attribute.FONT_FAMILY] = 'Arial';
+  body.appendParagraph('CONFIDENTIAL — Contains protected health information and peer review work product. ' +
+    'Share only with RASLO accounts. Do not download, print, or forward outside RASLO.').setAttributes(phiStyle);
+
   body.appendHorizontalRule();
   body.appendParagraph('');
 
@@ -2454,9 +2675,10 @@ function generateBODSummaryDoc() {
     var caseHeading = body.appendParagraph('Case ' + (c + 1) + ' of ' + cases.length + '  —  ' + caseId);
     caseHeading.setAttributes(headingStyle);
 
-    var tableData = [
-      ['Patient', patient],
-      ['MRN/FIN', mrn],
+    // Minimum necessary: the board decides on the reading, not the patient,
+    // so cases are identified by Case ID unless the owner opts in.
+    var tableData = CONFIG.BOD_INCLUDE_IDENTIFIERS ? [['Patient', patient], ['MRN/FIN', mrn]] : [];
+    tableData = tableData.concat([
       ['System', system],
       ['Study Type', studyType],
       ['Organ System', organSystem || '(not specified)'],
@@ -2464,7 +2686,7 @@ function generateBODSummaryDoc() {
       ['Imaging Rating', rating],
       ['Reviewing Physician', reviewer || '(none assigned)'],
       ['Status', status]
-    ];
+    ]);
 
     var table = body.appendTable();
     table.setBorderColor('#cccccc');
@@ -2563,7 +2785,8 @@ function generateBODSummaryDoc() {
     '<p><a href="' + docUrl + '" target="_blank">' + escapeHtml_(docTitle) + '</a></p>' +
     '<a class="btn" href="' + docUrl + '" target="_blank">Open Document</a>' +
     '<div class="details">' +
-    'The document is in your Google Drive. You can share it with partners or email it before the BOD meeting.<br><br>' +
+    'The document is in your Google Drive and is shared with no one. It contains PHI: share it only with ' +
+    'RASLO accounts using the Share button, and do not attach it to email or download it.<br><br>' +
     'Tip: After the meeting, update the final ratings and status to "Completed" on the RASLO sheet, ' +
     'then use "Archive Completed Cases" to move them off the active tracker.' +
     '</div>'
@@ -2661,7 +2884,69 @@ function fillTemplate_(t, reps) {
 function appendNote_(existing, note) {
   var c = (existing||'').toString().trim();
   var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
-  return c ? c + '\n[' + ts + '] ' + note : '[' + ts + '] ' + note;
+  // HIPAA audit: record who took the action alongside what and when.
+  var who = getActorEmail_();
+  var line = '[' + ts + '] ' + note + (who ? ' (by ' + who + ')' : '');
+  return c ? c + '\n' + line : line;
+}
+
+
+// ---------------------------------------------------------------------------
+// PHI email egress control (HIPAA)
+// ---------------------------------------------------------------------------
+
+// Free consumer mailboxes are never covered by a BAA, so they can't be added
+// to the approved list even by mistake.
+var CONSUMER_EMAIL_DOMAINS_ = [
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com', 'hotmail.com', 'outlook.com',
+  'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com', 'mac.com', 'proton.me',
+  'protonmail.com', 'gmx.com', 'mail.com', 'zoho.com', 'comcast.net', 'att.net', 'sbcglobal.net'
+];
+
+/** Domains allowed to receive PHI: Script Property override, else CONFIG default. */
+function getPhiAllowedDomains_() {
+  var prop = '';
+  try { prop = PropertiesService.getScriptProperties().getProperty('PHI_ALLOWED_DOMAINS') || ''; } catch (e) { }
+  var list = prop.split(',').map(function(d) { return d.trim().toLowerCase(); }).filter(Boolean);
+  return list.length ? list : CONFIG.PHI_ALLOWED_DOMAINS_DEFAULT.slice();
+}
+
+/**
+ * True when every address in a comma/semicolon-separated recipient string
+ * is on an approved domain (or a subdomain of one) and none is a consumer
+ * mailbox. Accepts "Name <addr>" forms.
+ */
+function isPhiRecipientAllowed_(recipients, allowed) {
+  allowed = allowed || getPhiAllowedDomains_();
+  var parts = (recipients || '').toString().split(/[,;]/).map(function(s) { return s.trim(); }).filter(Boolean);
+  if (parts.length === 0) return false;
+  for (var i = 0; i < parts.length; i++) {
+    var m = parts[i].match(/<([^>]+)>/);
+    var addr = (m ? m[1] : parts[i]).trim().toLowerCase();
+    var at = addr.lastIndexOf('@');
+    if (at < 1 || at === addr.length - 1) return false;
+    var domain = addr.substring(at + 1);
+    if (CONSUMER_EMAIL_DOMAINS_.indexOf(domain) >= 0) return false;
+    var ok = false;
+    for (var j = 0; j < allowed.length; j++) {
+      if (domain === allowed[j] || domain.slice(-(allowed[j].length + 1)) === '.' + allowed[j]) { ok = true; break; }
+    }
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * The only way this script sends email that contains PHI. Refuses any
+ * recipient outside the approved domains, so a typo or personal address on
+ * the Radiologists sheet can't cause a disclosure.
+ */
+function sendPhiEmail_(to, subject, body) {
+  if (!isPhiRecipientAllowed_(to)) {
+    throw new Error('Blocked: ' + to + ' is not on an approved email domain (' +
+      getPhiAllowedDomains_().join(', ') + '). See Setup > Set Approved Email Domains.');
+  }
+  GmailApp.sendEmail(to, subject, body, { name: 'RASLO Peer Review' });
 }
 
 /** Writes a bold header into the given column if it isn't already there. */
