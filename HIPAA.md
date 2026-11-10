@@ -44,7 +44,8 @@ Google's HIPAA page lists the covered Workspace services, including Gmail, Googl
    - Enable the Vertex AI API in that project.
    - Grant the **Vertex AI User** role to each person who will use the Gemini menu items.
    - Optionally link the Apps Script project to this Cloud project (Apps Script editor → Project Settings → Google Cloud Platform project). Do this if Vertex calls fail with a "project has not enabled the API" error.
-   - Run **Setup → Configure Vertex AI (HIPAA)**. Use a US region such as `us-central1`.
+   - Run **Setup → Configure Vertex AI (HIPAA)**. Use location `us` and model `gemini-3.8-flash`. Current Gemini models are served only from the `us`/`eu` multi-region endpoints, not from single regions like `us-west1`. The dialog sends a test prompt with no patient data before saving.
+   - The configured project is `gen-lang-client-0424753179` ("PR Peer Review"). It sits in the ra-slo.com organization with billing enabled. Confirm that billing account is covered by the Google Cloud BAA.
 4. **Revoke the old Gemini API key.** Configuring Vertex AI deletes the key from Script Properties, but the key itself stays valid until revoked. Delete it in Google AI Studio or in the Cloud console's Credentials page.
 5. **Review past disclosures with your privacy officer.** Before v8.5, case text including patient names and MRNs went to the AI Studio API, which has no BAA. That may be an impermissible disclosure that needs a documented breach risk assessment. Earlier subject lines also carried patient names, and nothing stopped emails to non-RASLO addresses. The `_DebugLog` sheet and the Gemini Input sheet show roughly when Gemini intake was used.
 6. **Remove non-workforce editors.** Only RASLO workforce accounts, or organizations with a signed BAA, may have access to the spreadsheet. A non-RASLO account was shared on the sheet earlier for menu testing. Remove it unless a BAA covers that person.
@@ -81,7 +82,7 @@ Google's HIPAA page lists the covered Workspace services, including Gmail, Googl
 | Setting | Where | Default |
 |---|---|---|
 | `VERTEX_PROJECT_ID` | Script Properties, set via Setup menu | none (Gemini disabled) |
-| `VERTEX_LOCATION` | Script Properties | `us-central1` |
-| `VERTEX_MODEL` | Script Properties | `gemini-2.5-pro` |
+| `VERTEX_LOCATION` | Script Properties | `us` (US multi-region). `global` is refused. |
+| `VERTEX_MODEL` | Script Properties | `gemini-3.8-flash` (GA, retirement no sooner than Sep 2027) |
 | `PHI_ALLOWED_DOMAINS` | Script Properties, set via Setup menu | `ra-slo.com` |
 | `BOD_INCLUDE_IDENTIFIERS` | `CONFIG` in Code.js | `false` |

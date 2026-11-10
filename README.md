@@ -48,6 +48,10 @@ Other things every editor should expect:
 - **The 30-minute reply trigger runs as whoever installed it** (normally the owner), so it keeps working regardless of other editors' library access.
 - Simple triggers like `onOpen` only fire for a signed-in account that is an explicit editor. Anonymous link access and viewer access never show the menu.
 
+## v8.5.1 — Vertex AI endpoint fix (2026-11-10)
+
+Pasting a case failed with a Vertex AI 404 for `gemini-3.8-flash` in `us-west1`. Current Gemini models are served only from the `us`/`eu` multi-region endpoints (`aiplatform.us.rep.googleapis.com`), not single regions. The script now builds multi-region URLs, defaults to location `us` and model `gemini-3.8-flash`, and tests the settings with a no-PHI prompt before saving them. `gemini-2.5-pro`, the old default, was retired Oct 20, 2026.
+
 ## v8.5 — HIPAA technical safeguards (2026-11-09)
 
 See [HIPAA.md](HIPAA.md) for the full picture, including the owner actions that code can't do.

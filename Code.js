@@ -1,7 +1,18 @@
 
 // ============================================================================
-// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.5
+// RASLO PEER REVIEW MANAGEMENT SYSTEM v8.5.1
 // Google Apps Script — Full Codebase
+// ============================================================================
+// v8.5.1 CHANGES (from v8.5) — VERTEX AI ENDPOINT FIX:
+//   - FIX: Current Gemini models (e.g. gemini-3.8-flash) are served only from
+//     the "us"/"eu" multi-region endpoints (aiplatform.us.rep.googleapis.com),
+//     not single regions, so us-west1 returned 404. vertexGenerateUrl_ now
+//     builds multi-region URLs; "global" is still refused for PHI.
+//   - Defaults: location "us", model gemini-3.8-flash (gemini-2.5-pro was
+//     retired Oct 20, 2026).
+//   - Configure Vertex AI now runs a no-PHI test call before saving, and the
+//     404 error explains the region problem.
+//   - HTTP call factored into vertexGenerate_ (same PHI-safe error handling).
 // ============================================================================
 // v8.5 CHANGES (from v8.4) — HIPAA TECHNICAL SAFEGUARDS (see HIPAA.md):
 //   - SECURITY: Gemini now runs only through Vertex AI (aiplatform, regional
@@ -141,8 +152,11 @@ var CONFIG = {
   // ---- HIPAA safeguards (v8.5) ----
   // Gemini runs only on Vertex AI. Project ID is a Script Property set via
   // Setup > Configure Vertex AI; these are the defaults for the other two.
-  VERTEX_DEFAULT_LOCATION: 'us-central1',
-  VERTEX_DEFAULT_MODEL: 'gemini-2.5-pro',
+  // "us" = US multi-region endpoint (aiplatform.us.rep.googleapis.com).
+  // gemini-3.8-flash is long-term GA (retirement no sooner than Sep 2027);
+  // gemini-2.5-pro was retired Oct 20, 2026.
+  VERTEX_DEFAULT_LOCATION: 'us',
+  VERTEX_DEFAULT_MODEL: 'gemini-3.8-flash',
   // Emails containing PHI may only go to these domains (and their
   // subdomains). Override with the PHI_ALLOWED_DOMAINS Script Property via
   // Setup > Set Approved Email Domains.
@@ -1128,7 +1142,115 @@ function exportToMMC() {
 // endpoint (generativelanguage.googleapis.com with an API key) has no BAA,
 // and its terms forbid clinical use, so that path was removed entirely.
 // Calls authenticate with the user's OAuth token, so no key appears in a URL.
-// A regional endpoint keeps processing in the configured region.
+//
+// Location: current Gemini models are served from the "us" (or "eu")
+// multi-region endpoint, aiplatform.us.rep.googleapis.com, not from single
+// regions like us-west1. Single-region endpoints still work for models that
+// offer them. The "global" endpoint is refused: Google says it gives no data
+// residency guarantee, while locational endpoints meet HIPAA requirements.
+
+/** True for locations PHI may be sent to: us, eu, or a single region. Never global. */
+function isAllowedVertexLocation_(loc) {
+  return /^(us|eu)$/.test(loc) || /^[a-z]+-[a-z]+[0-9]+$/.test(loc);
+}
+
+/** generateContent URL for the configured project, location, and model. */
+function vertexGenerateUrl_(cfg) {
+  var host = /^(us|eu)$/.test(cfg.location)
+    ? 'aiplatform.' + cfg.location + '.rep.googleapis.com'   // multi-region
+    : cfg.location + '-aiplatform.googleapis.com';           // single region
+  return 'https://' + host + '/v1/projects/' + encodeURIComponent(cfg.projectId) +
+    '/locations/' + cfg.location + '/publishers/google/models/' + encodeURIComponent(cfg.model) +
+    ':generateContent';
+}
+
+/**
+ * Sends one prompt to Gemini on Vertex AI and returns the answer text.
+ * HIPAA: never logs or throws the prompt or the model's output. Errors carry
+ * only status codes, API error text (which describes configuration, not
+ * content), block/finish reasons, and lengths.
+ */
+function vertexGenerate_(cfg, prompt, maxOutputTokens, logName) {
+  if (!isAllowedVertexLocation_(cfg.location)) {
+    throw new Error('Vertex AI location "' + cfg.location + '" is not allowed for PHI. ' +
+      'Run Setup > Configure Vertex AI (HIPAA) and use "us".');
+  }
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: maxOutputTokens, responseMimeType: 'application/json' }
+    }),
+    muteHttpExceptions: true
+  };
+
+  var response, responseText;
+  try {
+    response = UrlFetchApp.fetch(vertexGenerateUrl_(cfg), options);
+    responseText = response.getContentText();
+    debugLog_(logName, 'HTTP ' + response.getResponseCode() + ', length: ' + responseText.length);
+  } catch (fetchErr) {
+    debugError_(logName, 'FETCH FAILED: ' + fetchErr.message);
+    throw new Error('Could not reach Vertex AI: ' + fetchErr.message);
+  }
+
+  var result = null;
+  try { result = JSON.parse(responseText); } catch (e) { }
+
+  var code = response.getResponseCode();
+  if (code !== 200) {
+    var apiErr = result && result.error ? ((result.error.status || '') + ' ' + (result.error.message || '')).trim() : '';
+    var hint = '';
+    if (code === 403) {
+      hint = ' Check that the Vertex AI API is enabled in project ' + cfg.projectId +
+        ' and that your account has the "Vertex AI User" role there.';
+    } else if (code === 404) {
+      hint = /^(us|eu)$/.test(cfg.location)
+        ? ' Check that the model ID "' + cfg.model + '" is spelled correctly and is a current Gemini model.'
+        : ' Current Gemini models are not served from single regions like ' + cfg.location +
+          '. Run Setup > Configure Vertex AI (HIPAA) and set the location to "us".';
+    }
+    var errMsg = 'Vertex AI HTTP ' + code + (apiErr ? ': ' + apiErr.substring(0, 300) : '') + '.' + hint;
+    debugError_(logName, errMsg);
+    throw new Error(errMsg);
+  }
+
+  if (!result) {
+    debugError_(logName, 'Response body was not JSON (' + responseText.length + ' chars)');
+    throw new Error('Vertex AI returned a response that was not JSON.');
+  }
+
+  if (!result.candidates || !result.candidates[0] || !result.candidates[0].content) {
+    var why = (result.promptFeedback && result.promptFeedback.blockReason) ||
+      (result.candidates && result.candidates[0] && result.candidates[0].finishReason) || 'unknown';
+    debugError_(logName, 'No usable candidate (reason: ' + why + ')');
+    throw new Error('Gemini returned no answer (reason: ' + why + ').');
+  }
+
+  var parts = result.candidates[0].content.parts || [];
+  var text = '';
+  for (var p = 0; p < parts.length; p++) {
+    if (parts[p].thought !== true && parts[p].text) text = parts[p].text;
+  }
+  if (!text && parts.length) text = parts[parts.length - 1].text || '';
+  return text;
+}
+
+/**
+ * Checks a Vertex configuration with a fixed prompt that contains no PHI.
+ * Returns '' on success, or the error message.
+ */
+function testVertexConfig_(cfg) {
+  try {
+    var out = vertexGenerate_(cfg, 'Return the JSON object {"ok": true} and nothing else.', 256, 'testVertexConfig_');
+    var parsed = JSON.parse(out.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim());
+    return parsed && parsed.ok === true ? '' : 'The model answered, but not with the expected test reply.';
+  } catch (e) {
+    return e.message;
+  }
+}
 
 function getVertexConfig_() {
   var props = PropertiesService.getScriptProperties();
@@ -1164,23 +1286,34 @@ function promptForVertexConfig() {
     return;
   }
 
-  var r2 = ui.prompt('Region',
-    'Regional location for processing (leave blank for ' + cur.location + ').\n' +
-    'Use a US region such as us-central1 or us-west1. "global" is not allowed for PHI.', ui.ButtonSet.OK_CANCEL);
+  var r2 = ui.prompt('Location',
+    'Processing location (leave blank for ' + cur.location + ').\n' +
+    'Use "us". Current Gemini models are served from the US multi-region, not single regions like us-west1.\n' +
+    '"global" is not allowed for PHI.', ui.ButtonSet.OK_CANCEL);
   if (r2.getSelectedButton() !== ui.Button.OK) return;
-  var location = r2.getResponseText().trim() || cur.location;
-  if (!/^[a-z]+-[a-z]+[0-9]+$/.test(location)) {
-    ui.alert('Invalid region', 'Enter a regional location like us-central1.', ui.ButtonSet.OK);
+  var location = r2.getResponseText().trim().toLowerCase() || cur.location;
+  if (!isAllowedVertexLocation_(location)) {
+    ui.alert('Invalid location', 'Enter "us" (recommended) or a single region like us-central1. ' +
+      '"global" is not allowed for PHI.', ui.ButtonSet.OK);
     return;
   }
 
   var r3 = ui.prompt('Gemini model',
     'Model ID (leave blank for ' + cur.model + ').', ui.ButtonSet.OK_CANCEL);
   if (r3.getSelectedButton() !== ui.Button.OK) return;
-  var model = r3.getResponseText().trim() || cur.model;
+  var model = r3.getResponseText().trim().toLowerCase() || cur.model;
   if (!/^[a-z0-9][a-z0-9.\-]*$/.test(model)) {
-    ui.alert('Invalid model ID', 'Model IDs look like gemini-2.5-pro.', ui.ButtonSet.OK);
+    ui.alert('Invalid model ID', 'Model IDs look like ' + CONFIG.VERTEX_DEFAULT_MODEL + '.', ui.ButtonSet.OK);
     return;
+  }
+
+  // Try the settings with a harmless test prompt before saving them, so a
+  // wrong model or location shows up here instead of in the middle of a case.
+  var testErr = testVertexConfig_({ projectId: projectId, location: location, model: model });
+  if (testErr) {
+    if (ui.alert('Vertex AI test failed',
+        testErr + '\n\nThe test sent no patient data. Save these settings anyway?',
+        ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
   }
 
   props.setProperty('VERTEX_PROJECT_ID', projectId);
@@ -1192,11 +1325,12 @@ function promptForVertexConfig() {
   props.deleteProperty('GEMINI_API_KEY');
 
   debugLog_('promptForVertexConfig', 'Vertex AI configured: project=' + projectId + ', location=' + location +
-    ', model=' + model + (hadKey ? '; legacy AI Studio API key deleted' : ''));
+    ', model=' + model + (testErr ? ' (saved despite failed test)' : ' (test passed)') +
+    (hadKey ? '; legacy AI Studio API key deleted' : ''));
   ui.alert('Vertex AI configured',
-    'Gemini extraction will use project ' + projectId + ' in ' + location + '.' +
-    (hadKey ? '\n\nThe old Gemini API key was deleted from Script Properties.' : '') +
-    '\n\nTip: try "Paste New Case" with dummy text first to confirm access.', ui.ButtonSet.OK);
+    'Gemini extraction will use ' + model + ' in project ' + projectId + ', location ' + location + '.' +
+    (testErr ? '\n\nThe connection test failed, so extraction will fail until that is fixed.' : '\n\nConnection test passed.') +
+    (hadKey ? '\n\nThe old Gemini API key was deleted from Script Properties.' : ''), ui.ButtonSet.OK);
 }
 
 function callGemini_(freeformText) {
@@ -1207,9 +1341,6 @@ function callGemini_(freeformText) {
     throw new Error('Gemini extraction is disabled until Vertex AI is configured. An owner must run ' +
       'Peer Review > Setup > Configure Vertex AI (HIPAA). Patient data is never sent to AI services without a BAA.');
   }
-  var url = 'https://' + cfg.location + '-aiplatform.googleapis.com/v1/projects/' +
-    encodeURIComponent(cfg.projectId) + '/locations/' + cfg.location +
-    '/publishers/google/models/' + encodeURIComponent(cfg.model) + ':generateContent';
 
   // Organ system options come from the live Reference sheet so the prompt
   // always matches the dropdown the user maintains.
@@ -1235,69 +1366,7 @@ function callGemini_(freeformText) {
     'Text to parse:\n"""\n' + freeformText + '\n"""\n\n' +
     'Return ONLY the JSON object, no markdown, no explanation.';
 
-  var payload = {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.1, maxOutputTokens: 16384, responseMimeType: 'application/json' }
-  };
-
-  var options = {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  // HIPAA: nothing below logs or throws the model's output or the request
-  // text. Error messages carry only status codes, API error text (which
-  // describes configuration, not content), and lengths.
-  var response, responseText;
-  try {
-    response = UrlFetchApp.fetch(url, options);
-    responseText = response.getContentText();
-    debugLog_('callGemini_', 'HTTP ' + response.getResponseCode() + ', length: ' + responseText.length);
-  } catch (fetchErr) {
-    debugError_('callGemini_', 'FETCH FAILED: ' + fetchErr.message);
-    throw new Error('Could not reach Vertex AI: ' + fetchErr.message);
-  }
-
-  var result = null;
-  try { result = JSON.parse(responseText); } catch (e) { }
-
-  var code = response.getResponseCode();
-  if (code !== 200) {
-    var apiErr = result && result.error ? ((result.error.status || '') + ' ' + (result.error.message || '')).trim() : '';
-    var hint = '';
-    if (code === 403) {
-      hint = ' Check that the Vertex AI API is enabled in project ' + cfg.projectId +
-        ' and that your account has the "Vertex AI User" role there.';
-    } else if (code === 404) {
-      hint = ' Check the model ID (' + cfg.model + ') and region (' + cfg.location + ').';
-    }
-    var errMsg = 'Vertex AI HTTP ' + code + (apiErr ? ': ' + apiErr.substring(0, 300) : '') + '.' + hint;
-    debugError_('callGemini_', errMsg);
-    throw new Error(errMsg);
-  }
-
-  if (!result) {
-    debugError_('callGemini_', 'Response body was not JSON (' + responseText.length + ' chars)');
-    throw new Error('Vertex AI returned a response that was not JSON.');
-  }
-
-  if (!result.candidates || !result.candidates[0] || !result.candidates[0].content) {
-    var why = (result.promptFeedback && result.promptFeedback.blockReason) ||
-      (result.candidates && result.candidates[0] && result.candidates[0].finishReason) || 'unknown';
-    debugError_('callGemini_', 'No usable candidate (reason: ' + why + ')');
-    throw new Error('Gemini returned no answer (reason: ' + why + ').');
-  }
-
-  var parts = result.candidates[0].content.parts || [];
-  var text = '';
-  for (var p = 0; p < parts.length; p++) {
-    if (parts[p].thought !== true && parts[p].text) text = parts[p].text;
-  }
-  if (!text && parts.length) text = parts[parts.length - 1].text || '';
-
+  var text = vertexGenerate_(cfg, prompt, 16384, 'callGemini_');
   text = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
   try {

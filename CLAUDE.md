@@ -7,7 +7,7 @@ RASLO radiology peer-review system. Single-file Google Apps Script, container-bo
 - Apps Script project: `1xff8ILyGnzpbqj4PnmgFe6mzIf4O4JyJ2EoQ4GjsMjCgd6Fvv1un5mjs` (in `.clasp.json`, `rootDir: "."`)
 - Spreadsheet: `1UzWdq8wnh3N4wqVFqT3y-REYv82h3TAtlhlYzSTHKf8` (also `CONFIG.SPREADSHEET_ID` in Code.js)
 - EmailHub library: `1sKT8KV-5rbw-5n8ZwGjukKCgJ0ZRfupm-0mVJGSLF1d6v94hGB2tW5-Q`, dev mode, declared in `appsscript.json`. Its `runJob` path needs only the `spreadsheets` scope.
-- Vertex AI: project/region/model live in Script Properties (`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL`), set from the Setup menu. Not in the repo.
+- Vertex AI: project/region/model live in Script Properties (`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_MODEL`), set from the Setup menu. Not in the repo. Live project is `gen-lang-client-0424753179` ("PR Peer Review", ra-slo.com org). Use location `us`: current Gemini models are only on the `us`/`eu` multi-region endpoints (`aiplatform.us.rep.googleapis.com`), and single regions return 404. `global` is refused for PHI. Check model IDs and retirement dates at docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions. gcloud on this machine is signed in as the owner and can probe endpoints with a non-PHI prompt.
 - Deploy with `clasp push` from the repo root. There is no separate web-app deployment; everything runs from the sheet's menu plus one time-driven trigger (`checkForRepliesAuto_`, every 30 min).
 - GitHub: `timauran/Peer-Review`, branch `main`, public.
 
